@@ -6,6 +6,7 @@ from models import db, User, Channel, Message, VoiceSession
 from forms import LoginForm, RegisterForm, ChannelForm, SettingsForm
 import os
 from datetime import datetime
+from flask_sslify import SSLify
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24)
@@ -15,6 +16,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # 初始化扩展
 db.init_app(app)
 socketio = SocketIO(app)
+sslify = SSLify(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
@@ -448,7 +450,21 @@ def delete_channel(channel_id):
     return redirect(url_for('admin_panel'))
 
 if __name__ == '__main__':
-    with app.app_context(): # 添加 app_context
-        db.create_all() # 创建所有数据库表
-        create_initial_data() # 调用初始化数据函数
-    socketio.run(app, port=5005, debug=True) 
+    with app.app_context():
+        db.create_all()
+        create_initial_data()
+    
+    # 启动 Flask-SocketIO 应用，并启用 SSL
+    # 重要: 将 'path/to/your/cert.pem' 和 'path/to/your/key.pem' 替换为您的实际文件路径
+    # 例如，如果它们在项目根目录，就是 'cert.pem' 和 'key.pem'
+    ssl_context = ('cert.pem', 'key.pem') # 或者 ('ssl/cert.pem', 'ssl/key.pem')
+    
+    print("Starting server with SSL context...")
+    socketio.run(app, 
+                 host='0.0.0.0', # 监听所有网络接口
+                 port=5005,      # 您希望使用的端口
+                 debug=True,     # 开发时可以开启debug
+                 ssl_context=ssl_context)
+    
+    # 如果不使用 Flask-SocketIO 的 run，而是 Flask 自带的 app.run() (不推荐用于 SocketIO)
+    # app.run(host='0.0.0.0', port=5000, debug=True, ssl_context=ssl_context) 
