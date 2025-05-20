@@ -417,11 +417,12 @@
                 });
 
                 if (inVoiceChannel && localStreamReady) { // <--- 检查 localStream 是否就绪
-                    console.debug("[MainHTML] localStream is ready, directly creating peer connections for existing users:", usersToConnect);
+                    console.debug("[MainHTML] voice_channel_users: localStream is ready, processing existing users:", usersToConnect);
                     usersToConnect.forEach(userId => {
                         if (typeof createPeerConnection === 'function' && typeof negotiateConnection === 'function') {
+                             console.debug("[MainHTML] voice_channel_users: Creating and Negotiating for user:", userId);
                              createPeerConnection(userId); 
-                             // negotiateConnection(userId); // 接收方通常不主动发起协商，而是等待 offer
+                             negotiateConnection(userId); // <--- 确保这里调用了 negotiateConnection
                         }
                     });
                 } else if (inVoiceChannel) { // 在频道中，但媒体流还未就绪

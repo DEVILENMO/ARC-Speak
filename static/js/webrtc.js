@@ -163,12 +163,25 @@ function createPeerConnection(userId) {
         // Further handling for states like 'disconnected', 'closed' can be added here.
     };
 
-    pc.onnegotiationneeded = event => {
-        console.debug(`[WebRTC] Negotiation needed for user ${userId}. Event:`, event);
-        // This event can sometimes be used to trigger renegotiation if needed, 
-        // but often offer/answer is handled ينايرally.
+    pc.onicecandidateerror = event => {
+        console.error(`[WebRTC] ICE candidate error for user ${userId}:`, event);
     };
-    
+
+    // Temporarily comment out onnegotiationneeded to simplify initiation logic
+    /*
+    pc.onnegotiationneeded = async event => {
+        console.debug(`[WebRTC] Negotiation needed for user ${userId}. Event:`, event);
+        // Condition to prevent repeated negotiation if already in progress or state is not stable
+        // The signalingState check helps prevent glare, !makingOffer prevents re-entrancy.
+        if (!makingOffer[userId] && pc.signalingState === 'stable') {
+            console.debug(`[WebRTC] Inside onnegotiationneeded, about to call negotiateConnection for ${userId}. SignalingState: ${pc.signalingState}, MakingOffer: ${makingOffer[userId]}`);
+            await negotiateConnection(userId);
+        } else {
+            console.debug(`[WebRTC] Skipping negotiation for ${userId} due to signalingState ${pc.signalingState} or offer already in progress (${makingOffer[userId]}).`);
+        }
+    };
+    */
+
     pc.ontrack = event => {
         console.log(`[WebRTC] Received remote track from user ${userId}:`, event.track, 'Stream(s):', event.streams);
         const remoteAudioContainer = document.getElementById('remote-audio-container');
@@ -210,6 +223,11 @@ function createPeerConnection(userId) {
         } else {
             console.debug(`[WebRTC] Remote stream for user ${userId} already attached to <audio> element.`);
         }
+    };
+    
+    pc.ondatachannel = event => {
+        console.log(`[WebRTC] Received data channel from user ${userId}:`, event.channel);
+        // Handle data channel event
     };
     
     return pc;
