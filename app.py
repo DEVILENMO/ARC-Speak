@@ -323,7 +323,11 @@ def handle_message(data):
 # WebSocket: 加入语音频道
 @socketio.on('join_voice_channel')
 def handle_join_voice_channel(data):
-    channel_id = data['channel_id']
+    channel_id = data.get('channel_id') # Ensure client sends this
+    if not channel_id:
+        emit('error', {'message': 'Channel ID missing in join_voice_channel request'})
+        return
+
     target_channel = Channel.query.get(channel_id)
 
     if not target_channel:
@@ -342,43 +346,91 @@ def handle_join_voice_channel(data):
     # 检查用户是否已在其他语音频道
     existing_session = VoiceSession.query.filter_by(user_id=current_user.id).first()
     if existing_session:
-        leave_room(f"voice_channel_{existing_session.channel_id}")
-        db.session.delete(existing_session)
+        if existing_session.channel_id != channel_id: # Only leave if it's a different channel
+            old_channel_id = existing_session.channel_id
+            leave_room(f"voice_channel_{old_channel_id}")
+            db.session.delete(existing_session)
+            # Notify users in the old channel that this user left
+            emit('user_left_voice', {
+                'channel_id': old_channel_id, 
+                'user_id': current_user.id
+            }, room=f"voice_channel_{old_channel_id}")
+        else: # Already in this channel, maybe a rejoin attempt or client UI refresh
+            pass # Or resend user list to this user? For now, assume client handles UI.
     
-    # 创建新的语音会话
-    new_session = VoiceSession(
-        user_id=current_user.id,
-        channel_id=channel_id
-    )
-    db.session.add(new_session)
-    db.session.commit()
+    # 创建新的语音会话 (or update if already exists for this channel due to above logic)
+    # To prevent duplicate sessions if user is already in the target channel and existing_session matched channel_id
+    current_session_in_target_channel = VoiceSession.query.filter_by(user_id=current_user.id, channel_id=channel_id).first()
+    if not current_session_in_target_channel:
+        new_session = VoiceSession(
+            user_id=current_user.id,
+            channel_id=channel_id
+        )
+        db.session.add(new_session)
+    
+    db.session.commit() # Commit changes (new session, or deletion of old one)
     
     # 加入房间
     join_room(f"voice_channel_{channel_id}")
     
     # 获取频道中的所有用户
     users_in_channel = VoiceSession.query.filter_by(channel_id=channel_id).all()
-    user_list = [{'user_id': session.user.id, 'username': session.user.username} for session in users_in_channel]
+    user_list = [{'user_id': session.user.id, 'username': session.user.username} for session in users_in_channel if session.user]
     
-    # 通知所有用户
-    emit('voice_channel_users', {'users': user_list}, room=f"voice_channel_{channel_id}")
-    emit('user_joined_voice', {'user_id': current_user.id, 'username': current_user.username}, room=f"voice_channel_{channel_id}")
+    # 通知发起请求的用户当前频道内的所有用户
+    emit('voice_channel_users', {
+        'channel_id': channel_id, 
+        'users': user_list
+    }, room=request.sid) # Emitting only to the requester
+
+    # 通知房间内其他用户有新人加入 (if they weren't already in this session)
+    if not existing_session or existing_session.channel_id != channel_id:
+        emit('user_joined_voice', {
+            'channel_id': channel_id,
+            'user_id': current_user.id, 
+            'username': current_user.username,
+            'avatar_url': current_user.avatar_url # Good to send avatar here too
+        }, room=f"voice_channel_{channel_id}", skip_sid=request.sid)
+    print(f"User {current_user.username} processed join for voice channel {channel_id}. SID: {request.sid}")
 
 # WebSocket: 离开语音频道
 @socketio.on('leave_voice_channel')
-def handle_leave_voice_channel():
+def handle_leave_voice_channel(data): # Expecting data to contain channel_id from client
+    # It's safer for client to tell which channel it *thinks* it's leaving
+    channel_id_from_client = data.get('channel_id') 
+
     session = VoiceSession.query.filter_by(user_id=current_user.id).first()
     if session:
-        channel_id = session.channel_id
-        leave_room(f"voice_channel_{channel_id}")
+        # If client specified a channel_id, ensure it matches the one in DB for this user
+        # This adds a layer of safety but can be simplified if we trust the client or VoiceSession is the sole truth
+        if channel_id_from_client is not None and session.channel_id != channel_id_from_client:
+            print(f"Warning: User {current_user.username} attempting to leave voice channel {channel_id_from_client} but DB session says {session.channel_id}")
+            # Potentially emit error back to client or just use DB session.channel_id
+            # For now, we'll trust the DB session as the source of truth for which channel they were in.
+        
+        channel_id_to_leave = session.channel_id # Use channel_id from DB session
+
+        leave_room(f"voice_channel_{channel_id_to_leave}")
         db.session.delete(session)
         db.session.commit()
-        emit('user_left_voice', {'user_id': current_user.id}, room=f"voice_channel_{channel_id}")
+        
+        emit('user_left_voice', {
+            'channel_id': channel_id_to_leave,
+            'user_id': current_user.id
+        }, room=f"voice_channel_{channel_id_to_leave}")
+        print(f"User {current_user.username} left voice channel {channel_id_to_leave}. SID: {request.sid}")
+    else:
+        # User was not in any voice session according to DB, maybe client state was out of sync.
+        # If client sent a channel_id, we could still try to emit to that room if we want, but it's less clean.
+        if channel_id_from_client:
+            print(f"User {current_user.username} requested leave for voice channel {channel_id_from_client}, but no active session found in DB.")
+        else:
+            print(f"User {current_user.username} requested leave_voice_channel but no active session found and no channel_id provided.")
 
 # WebSocket: 用户说话状态更新
 @socketio.on('user_speaking_status')
 def handle_user_speaking_status(data):
-    channel_id = data.get('channel_id')
+    channel_id = data.get('channel_id') # Client sends this
     speaking = data.get('speaking')
     user_id = current_user.id
 
@@ -386,7 +438,7 @@ def handle_user_speaking_status(data):
         room_name = f"voice_channel_{channel_id}"
         # print(f"User {user_id} speaking status {speaking} in room {room_name}") # For debugging
         emit('user_speaking',
-             {'user_id': user_id, 'speaking': speaking}, 
+             {'channel_id': channel_id, 'user_id': user_id, 'speaking': speaking}, 
              room=room_name, 
              skip_sid=request.sid) # skip_sid 确保事件不会发回给原始发送者
 
