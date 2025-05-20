@@ -182,30 +182,38 @@ async def main(page: ft.Page):
     sio_client = socketio.AsyncClient(http_session=shared_aiohttp_session, logger=True, engineio_logger=True)
 
     def update_voice_panel_button_visibility():
-        # Controls visibility of Join, Leave, and (future) Mute buttons
+        global page # 确保 page 对象可访问以用于更新
+        print(f"[DEBUG] update_voice_panel_button_visibility: previewing_vc_id={previewing_voice_channel_id}, is_active={is_actively_in_voice_channel}") # 调试打印当前状态
         confirm_join_btn = active_page_controls.get('confirm_join_voice_button')
         leave_voice_btn = active_page_controls.get('leave_voice_button')
         voice_settings_ctrl = active_page_controls.get('voice_settings_area')
-        # mute_btn = active_page_controls.get('mute_button') # Future
 
-        if previewing_voice_channel_id is not None: # If we are previewing *any* voice channel
-            if is_actively_in_voice_channel:
+        if previewing_voice_channel_id is not None: # 如果正在预览某个语音频道
+            if is_actively_in_voice_channel: # 如果用户已主动加入此语音频道
                 if confirm_join_btn: confirm_join_btn.visible = False
                 if leave_voice_btn: leave_voice_btn.visible = True
                 if voice_settings_ctrl: voice_settings_ctrl.visible = True
-                # if mute_btn: mute_btn.visible = True # Future
-            else: # Previewing but not actively joined
+            else: # 用户正在预览此语音频道，但未主动加入
                 if confirm_join_btn: confirm_join_btn.visible = True
                 if leave_voice_btn: leave_voice_btn.visible = False
                 if voice_settings_ctrl: voice_settings_ctrl.visible = False
-                # if mute_btn: mute_btn.visible = False # Future
-        else: # Not previewing any voice channel (e.g., text channel selected)
+        else: # 用户没有预览任何语音频道 (例如，当前在文本频道视图)
             if confirm_join_btn: confirm_join_btn.visible = False
             if leave_voice_btn: leave_voice_btn.visible = False
             if voice_settings_ctrl: voice_settings_ctrl.visible = False
-            # if mute_btn: mute_btn.visible = False # Future
         
-        if hasattr(page, 'update'): page.update() # Update the page to reflect button visibility
+        # 设置完 visible 属性后，打印这些控件的 visible 状态以供调试
+        if confirm_join_btn: print(f"  [DEBUG BTN] confirm_join_btn.visible = {confirm_join_btn.visible}")
+        if leave_voice_btn: print(f"  [DEBUG BTN] leave_voice_btn.visible = {leave_voice_btn.visible}")
+        if voice_settings_ctrl: print(f"  [DEBUG CTRL] voice_settings_ctrl.visible = {voice_settings_ctrl.visible}")
+
+        # 单独更新每个相关控件的UI
+        if confirm_join_btn and hasattr(confirm_join_btn, 'update'): confirm_join_btn.update()
+        if leave_voice_btn and hasattr(leave_voice_btn, 'update'): leave_voice_btn.update()
+        if voice_settings_ctrl and hasattr(voice_settings_ctrl, 'update'): voice_settings_ctrl.update()
+        
+        # 如果单个控件更新不够，可以考虑调用 page.update()，但这可能会刷新整个页面，通常应避免
+        # if hasattr(page, 'update'): page.update()
 
     def update_voice_channel_user_list_ui():
         # This function now updates the list for the PREVIEWING or ACTIVE voice channel
@@ -602,134 +610,282 @@ async def main(page: ft.Page):
                                         check_color=COLOR_PRIMARY_PURPLE,
                                         label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE))
 
-    async def _leave_current_voice_channel_if_any(page_ref: ft.Page, switch_to_text: bool = False, new_text_channel_id = None, new_text_channel_name = "Select a text channel"):
+    async def _leave_current_voice_channel_if_any(page_ref: ft.Page, called_from_select_new_voice: bool = False):
+        """
+        Handles leaving the currently active or previewed voice channel.
+        If called_from_select_new_voice is True, it means we are about to select a new voice channel,
+        so we don't switch the middle panel to text, and we don't clear previewing_voice_channel_id yet.
+        """
         global current_voice_channel_id, previewing_voice_channel_id, is_actively_in_voice_channel, current_voice_channel_active_users
         
-        effective_vc_id_to_leave = current_voice_channel_id if is_actively_in_voice_channel else previewing_voice_channel_id
+        channel_id_to_leave_on_server = None
+        was_actively_in_voice = is_actively_in_voice_channel
 
-        if sio_client and sio_client.connected and effective_vc_id_to_leave is not None:
-            try: 
-                print(f"Client emitting leave_voice_channel for channel_id: {effective_vc_id_to_leave}") # Debug print
-                await sio_client.emit('leave_voice_channel', {'channel_id': effective_vc_id_to_leave})
-            except Exception as e: 
+        if is_actively_in_voice_channel and current_voice_channel_id is not None:
+            channel_id_to_leave_on_server = current_voice_channel_id
+            print(f"User was active in VC {current_voice_channel_id}. Preparing to leave.")
+        elif not is_actively_in_voice_channel and previewing_voice_channel_id is not None:
+            # If only previewing, we might not need to tell the server "leave" unless our "join" for preview was a full join.
+            # Given server's join_voice_channel logic, a join is a join to the room. So yes, emit leave.
+            channel_id_to_leave_on_server = previewing_voice_channel_id
+            print(f"User was previewing VC {previewing_voice_channel_id}. Preparing to leave.")
+
+        if sio_client and sio_client.connected and channel_id_to_leave_on_server is not None:
+            try:
+                print(f"Client emitting leave_voice_channel for channel_id: {channel_id_to_leave_on_server} (due to leaving/switching)")
+                await sio_client.emit('leave_voice_channel', {'channel_id': channel_id_to_leave_on_server})
+            except Exception as e:
                 print(f"Error emitting leave_voice_channel: {e}")
         
         is_actively_in_voice_channel = False
-        current_voice_channel_id = None
-        previewing_voice_channel_id = None # Fully exit voice context
+        current_voice_channel_id = None # Always reset this when leaving active state
+        
+        if not called_from_select_new_voice: # If true, new preview ID will be set by caller
+            previewing_voice_channel_id = None 
+        
         current_voice_channel_active_users.clear()
-        update_voice_channel_user_list_ui() # Update UI (empty list, buttons hidden)
-        if active_page_controls.get('current_voice_channel_text'): active_page_controls['current_voice_channel_text'].value = "Not in a voice channel"
         
-        if switch_to_text:
-            switch_middle_panel_view("text", new_text_channel_name)
-            if new_text_channel_id is not None:
-                if active_page_controls.get('chat_messages_view'): active_page_controls['chat_messages_view'].controls.clear(); active_page_controls['chat_messages_view'].update()
-                if sio_client and sio_client.connected: await sio_client.emit('join_text_channel', {'channel_id': new_text_channel_id})
-        update_voice_panel_button_visibility()
+        # UI Updates
+        if active_page_controls.get('current_voice_channel_text'):
+            active_page_controls['current_voice_channel_text'].value = "Not in voice"
+            active_page_controls['current_voice_channel_text'].update()
+
+        update_voice_channel_user_list_ui() # This will clear the list and update buttons via its internal call
+
+        if not called_from_select_new_voice and not was_actively_in_voice : # if just previewing and now leaving preview (not to another voice chan)
+            # If we were only previewing and now we are leaving that preview (not to switch to another voice channel)
+            # then switch to a default text view if available.
+            current_text_channel_name = "Select a text channel"
+            if current_text_channel_id and text_channels_data.get(current_text_channel_id):
+                current_text_channel_name = text_channels_data[current_text_channel_id]['name']
+            else: # select first text channel if any
+                first_text_ch = next(iter(text_channels_data.values()), None)
+                if first_text_ch:
+                    current_text_channel_id = first_text_ch['id']
+                    current_text_channel_name = first_text_ch['name']
+                    # No need to emit join_text_channel here, switch_middle_panel_view will handle view
+                    # and if user explicitly clicks it, select_text_channel will handle emit.
+            switch_middle_panel_view("text", current_text_channel_name)
+
+        # update_voice_panel_button_visibility() # Called by update_voice_channel_user_list_ui
         if hasattr(page_ref, 'update'): page_ref.update()
-        
+        print(f"_leave_current_voice_channel_if_any executed. called_from_select_new_voice: {called_from_select_new_voice}")
+
 
     def switch_middle_panel_view(view_type: str, channel_name: str = ""):
         is_text_view = view_type == "text"
-        if active_page_controls.get('chat_panel_content_group'): active_page_controls['chat_panel_content_group'].visible = is_text_view
-        if active_page_controls.get('voice_panel_content_group'): active_page_controls['voice_panel_content_group'].visible = not is_text_view
-        if is_text_view and active_page_controls.get('current_chat_topic'): active_page_controls['current_chat_topic'].value = f"Chat - {channel_name}"
-        # Voice panel topic is updated within update_voice_channel_user_list_ui
-        update_voice_panel_button_visibility()
-        if hasattr(page, 'update'): page.update()
+        if active_page_controls.get('chat_panel_content_group'): 
+            active_page_controls['chat_panel_content_group'].visible = is_text_view
+            active_page_controls['chat_panel_content_group'].update()
+        if active_page_controls.get('voice_panel_content_group'): 
+            active_page_controls['voice_panel_content_group'].visible = not is_text_view
+            active_page_controls['voice_panel_content_group'].update()
+
+        if is_text_view:
+            if active_page_controls.get('current_chat_topic'): 
+                active_page_controls['current_chat_topic'].value = f"Chat - {channel_name}"
+                active_page_controls['current_chat_topic'].update()
+        else: # Voice view
+            # Voice panel topic display is handled by update_voice_channel_user_list_ui
+            pass
+        
+        update_voice_panel_button_visibility() # This is crucial after view switch
+        # if hasattr(page, 'update'): page.update() # Button visibility should handle its own page update
+
 
     async def select_text_channel(page_ref: ft.Page, channel_id: int, channel_name: str):
-        global current_text_channel_id, previewing_voice_channel_id, is_actively_in_voice_channel
-        if current_text_channel_id == channel_id and active_page_controls.get('chat_panel_content_group', {}).get('visible', True): return
-
-        if previewing_voice_channel_id is not None: # Was previewing or in a voice channel
-            await _leave_current_voice_channel_if_any(page_ref, switch_to_text=False) # Leave silently, don't switch panel yet
+        global current_text_channel_id
         
+        chat_panel = active_page_controls.get('chat_panel_content_group')
+        # If already on this text channel and its view is visible, do nothing
+        if current_text_channel_id == channel_id and chat_panel and chat_panel.visible:
+            return
+
+        print(f"Selecting text channel: {channel_name} (ID: {channel_id})")
         current_text_channel_id = channel_id
+        
+        # Switch middle panel to text view
         switch_middle_panel_view("text", channel_name)
-        if active_page_controls.get('chat_messages_view'): active_page_controls['chat_messages_view'].controls.clear(); active_page_controls['chat_messages_view'].update()
-        if sio_client and sio_client.connected: await sio_client.emit('join_text_channel', {'channel_id': channel_id})
+        
+        if active_page_controls.get('chat_messages_view'):
+            active_page_controls['chat_messages_view'].controls.clear()
+            active_page_controls['chat_messages_view'].update()
+            
+        if sio_client and sio_client.connected:
+            try:
+                await sio_client.emit('join_text_channel', {'channel_id': channel_id})
+            except Exception as e:
+                print(f"Error emitting join_text_channel: {e}")
+
+        # Update the top bar if user is actively in a voice channel
+        if is_actively_in_voice_channel and current_voice_channel_id and voice_channels_data.get(current_voice_channel_id):
+            vc_name = voice_channels_data[current_voice_channel_id]['name']
+            if active_page_controls.get('current_voice_channel_text'):
+                active_page_controls['current_voice_channel_text'].value = f"Voice: {vc_name}"
+                active_page_controls['current_voice_channel_text'].update()
+        elif previewing_voice_channel_id and voice_channels_data.get(previewing_voice_channel_id):
+             # If only previewing a voice channel, and text channel is selected, top bar should reflect that we are not "in" voice
+            if active_page_controls.get('current_voice_channel_text'):
+                # vc_name = voice_channels_data[previewing_voice_channel_id]['name']
+                # active_page_controls['current_voice_channel_text'].value = f"Preview: {vc_name}" # Or "Not in voice"
+                active_page_controls['current_voice_channel_text'].value = "Not in voice" # Simpler: if text view active, show "Not in voice" unless *actively* in one
+                active_page_controls['current_voice_channel_text'].update()
+        else:
+            if active_page_controls.get('current_voice_channel_text'):
+                active_page_controls['current_voice_channel_text'].value = "Not in voice"
+                active_page_controls['current_voice_channel_text'].update()
+
+
         if hasattr(page_ref, 'update'): page_ref.update()
+
 
     async def select_voice_channel(page_ref: ft.Page, channel_id: int, channel_name: str):
-        global previewing_voice_channel_id, is_actively_in_voice_channel, current_voice_channel_active_users, current_text_channel_id
+        global previewing_voice_channel_id, is_actively_in_voice_channel, current_voice_channel_active_users, current_text_channel_id, current_voice_channel_id
 
-        if previewing_voice_channel_id == channel_id and not is_actively_in_voice_channel and active_page_controls.get('voice_panel_content_group',{}).get('visible',False):
-             return # Already previewing this and view is correct
-        if current_voice_channel_id == channel_id and is_actively_in_voice_channel and active_page_controls.get('voice_panel_content_group',{}).get('visible',False):
-             return # Already actively in this channel and view is correct
+        print(f"--- select_voice_channel START for {channel_name} ---")
+        is_actively_in_voice_channel = False # FORCE SET AT START
+        print(f"[DEBUG select_voice_channel_1] is_active = {is_actively_in_voice_channel}")
+
+        voice_panel = active_page_controls.get('voice_panel_content_group')
+
+        # This check should now always fail for the is_actively_in_voice_channel part if we force False above
+        if is_actively_in_voice_channel and current_voice_channel_id == channel_id: 
+            if not (voice_panel and voice_panel.visible):
+                switch_middle_panel_view("voice", channel_name)
+            print(f"Already actively in voice channel {channel_name}. View ensured. (Early exit via active state)")
+            return
+        
+        # This check handles if we are already previewing the target channel
+        if not is_actively_in_voice_channel and previewing_voice_channel_id == channel_id:
+            if not (voice_panel and voice_panel.visible):
+                switch_middle_panel_view("voice", channel_name)
+            print(f"Already previewing voice channel {channel_name}. View ensured. (Early exit via preview state)")
+            return
+            
+        # If switching from another voice channel (active or different preview), leave it first.
+        # Note: is_actively_in_voice_channel is currently forced False from above.
+        # So the first part of the OR for active check might not behave as intended without restoring its original check value before this block
+        # Let's refine this: we need to know the *actual* state before this function call or before the force set.
+        # However, for this specific debug, the forced False will simplify some paths.
+
+        # Simplified logic for leaving: if there's any preview or active VC, and it's different, leave.
+        # This is complex because `is_actively_in_voice_channel` is being forced. 
+        # The original condition was: 
+        # if (is_actively_in_voice_channel and current_voice_channel_id != channel_id and current_voice_channel_id is not None) or \
+        #    (not is_actively_in_voice_channel and previewing_voice_channel_id != channel_id and previewing_voice_channel_id is not None):
+        # Given that we are forcing `is_actively_in_voice_channel` to False at the start of this function for debugging, 
+        # the logic to determine if we *were* in an active channel to leave it is tricky here.
+        # For now, let's assume if previewing_voice_channel_id was set and is different, we should leave it.
+        if previewing_voice_channel_id is not None and previewing_voice_channel_id != channel_id:
+            print(f"Leaving previous previewed voice channel {previewing_voice_channel_id} before selecting {channel_name}.")
+            await _leave_current_voice_channel_if_any(page_ref, called_from_select_new_voice=True)
+            is_actively_in_voice_channel = False # Re-FORCE after await
+            print(f"[DEBUG select_voice_channel_2_after_leave] is_active = {is_actively_in_voice_channel}")
+        elif current_voice_channel_id is not None and current_voice_channel_id != channel_id: # Check if was in an active channel DIFFERENT from target
+            print(f"Was in active channel {current_voice_channel_id}, leaving it before selecting {channel_name}")
+            # This part of the logic might be less hit due to the forced False at the start for is_actively_in_voice_channel
+            # Need to be careful with state manipulation for debugging vs correct logic flow
+            await _leave_current_voice_channel_if_any(page_ref, called_from_select_new_voice=True)
+            is_actively_in_voice_channel = False # Re-FORCE after await
+            print(f"[DEBUG select_voice_channel_2_after_leave_active] is_active = {is_actively_in_voice_channel}")
+
+
+        previewing_voice_channel_id = channel_id
+        is_actively_in_voice_channel = False # FORCE SET AGAIN
+        current_voice_channel_id = None 
+        current_text_channel_id = None 
+        current_voice_channel_active_users.clear()
+        print(f"[DEBUG select_voice_channel_3_before_ui] is_active = {is_actively_in_voice_channel}, preview_id={previewing_voice_channel_id}")
+
+
+        if active_page_controls.get('current_voice_channel_text'):
+            active_page_controls['current_voice_channel_text'].value = f"Preview: {channel_name}"
+            active_page_controls['current_voice_channel_text'].update()
+
+        switch_middle_panel_view("voice", channel_name)
 
         if sio_client and sio_client.connected:
-            # Leave any previous voice channel (active or preview) before starting new preview
-            if previewing_voice_channel_id is not None and previewing_voice_channel_id != channel_id:
-                 await _leave_current_voice_channel_if_any(page_ref, switch_to_text=False)
-            elif is_actively_in_voice_channel and current_voice_channel_id != channel_id:
-                 await _leave_current_voice_channel_if_any(page_ref, switch_to_text=False)
-
-            previewing_voice_channel_id = channel_id
-            is_actively_in_voice_channel = False # Start in preview mode
-            current_text_channel_id = None # Clear selected text channel when focusing on voice
-            current_voice_channel_active_users.clear()
-            
             try:
-                await sio_client.emit('join_voice_channel', {'channel_id': channel_id}) # Soft join to get users
-                switch_middle_panel_view("voice", channel_name) # Switch view, updates buttons via its call to update_voice_panel_button_visibility
-                # update_voice_channel_user_list_ui will be called by SIO event voice_channel_users
-                if active_page_controls.get('current_voice_channel_text'): active_page_controls['current_voice_channel_text'].value = f"Preview: {channel_name}"
-            except Exception as e: print(f"Error joining/previewing voice channel: {e}")
-        if hasattr(page_ref, 'update'): page_ref.update()
+                print(f"Client emitting join_voice_channel for channel_id: {channel_id} (for preview)")
+                await sio_client.emit('join_voice_channel', {'channel_id': channel_id})
+            except Exception as e:
+                print(f"Error emitting join_voice_channel for preview: {e}")
+        
+        is_actively_in_voice_channel = False # FORCE SET ONE LAST TIME BEFORE FINAL UI UPDATE
+        print(f"[DEBUG select_voice_channel_4_before_update_list_ui] is_active = {is_actively_in_voice_channel}")
+        update_voice_channel_user_list_ui()
+        
+        if hasattr(page_ref, 'update'): # Ensure page_ref is the page object
+            page_ref.update() # Explicit page update after UI logic
+        
+        print(f"--- select_voice_channel END for {channel_name} ---")
+
 
     async def handle_confirm_join_voice_button_click(page_ref: ft.Page):
         global is_actively_in_voice_channel, current_voice_channel_id, previewing_voice_channel_id
-        if previewing_voice_channel_id is not None:
-            is_actively_in_voice_channel = True
-            current_voice_channel_id = previewing_voice_channel_id # Confirm active channel
-            # No need to emit join again, already did for preview
-            update_voice_channel_user_list_ui() # Update topic and button visibility
-            if active_page_controls.get('current_voice_channel_text'): active_page_controls['current_voice_channel_text'].value = f"Voice: {voice_channels_data.get(current_voice_channel_id, {}).get('name', 'Unknown')}"
+        
+        if previewing_voice_channel_id is None:
+            print("Error: Confirm join clicked but no channel is being previewed.")
+            return
+
+        print(f"Confirming join to voice channel ID: {previewing_voice_channel_id}")
+        is_actively_in_voice_channel = True
+        current_voice_channel_id = previewing_voice_channel_id # This is now the active channel
+        # previewing_voice_channel_id remains the same, as we are active in the channel we were previewing
+        
+        vc_name = "Unknown"
+        if current_voice_channel_id and voice_channels_data.get(current_voice_channel_id):
+            vc_name = voice_channels_data[current_voice_channel_id]['name']
+        
+        if active_page_controls.get('current_voice_channel_text'):
+            active_page_controls['current_voice_channel_text'].value = f"Voice: {vc_name}"
+            active_page_controls['current_voice_channel_text'].update()
+        
+        # Server join already happened for preview. If a more explicit "activate" signal is needed, send it here.
+        # For now, assume server handles this fine. Client state is now "active".
+        
+        update_voice_channel_user_list_ui() # Update UI elements (buttons, topic prefix)
         if hasattr(page_ref, 'update'): page_ref.update()
+        print(f"Successfully joined voice channel: {vc_name} (ID: {current_voice_channel_id})")
+
 
     async def handle_leave_voice_click(page_ref: ft.Page):
-        # This button is only visible if is_actively_in_voice_channel is True
-        global current_text_channel_id # Keep for context but not forcing switch
-        global previewing_voice_channel_id, voice_channels_data # Need these to stay on the same voice channel (preview)
+        global is_actively_in_voice_channel, current_voice_channel_id, previewing_voice_channel_id
+        
+        if not is_actively_in_voice_channel or current_voice_channel_id is None:
+            print("Error: Leave voice clicked but not actively in a voice channel.")
+            return
 
-        # We need to know which voice channel we are leaving to re-select it for preview.
-        channel_id_being_left = current_voice_channel_id # This is the channel we were actively in.
+        channel_id_being_left = current_voice_channel_id
         channel_name_being_left = "Unknown Voice Channel"
         if channel_id_being_left and voice_channels_data.get(channel_id_being_left):
             channel_name_being_left = voice_channels_data[channel_id_being_left]['name']
 
-        # Leave the voice channel, but don't switch the middle panel to a text channel.
-        # The _leave_current_voice_channel_if_any will reset is_actively_in_voice_channel to False
-        # and call update_voice_channel_user_list_ui -> update_voice_panel_button_visibility.
-        # This should revert the UI to the "preview" state for the channel we were just in.
-        await _leave_current_voice_channel_if_any(page_ref, switch_to_text=False)
+        print(f"Leaving voice channel: {channel_name_being_left} (ID: {channel_id_being_left})")
 
-        # After leaving, we want to ensure the UI is showing the preview for the channel we just left.
-        # _leave_current_voice_channel_if_any sets previewing_voice_channel_id to None.
-        # We need to re-establish it to show the preview of the channel we just left.
-        if channel_id_being_left is not None:
-            previewing_voice_channel_id = channel_id_being_left # Set it back for preview
-            # current_text_channel_id = None # Ensure no text channel is considered active
-            # current_voice_channel_active_users.clear() # Already done in _leave_current_voice_channel_if_any
-            
-            # Switch view to voice panel (if not already) and update its content for the preview state.
-            switch_middle_panel_view("voice", channel_name_being_left) 
-            update_voice_channel_user_list_ui() # This will update based on the new previewing_voice_channel_id
-                                                # and is_actively_in_voice_channel (which is now False)
-                                                # It also calls update_voice_panel_button_visibility.
-        else:
-            # If for some reason we couldn't identify the channel, maybe fall back to a default text view.
-            # This case should ideally not happen if leave button was visible.
-            first_text_ch = next(iter(text_channels_data.values()), None)
-            if first_text_ch:
-                await select_text_channel(page_ref, first_text_ch['id'], first_text_ch['name'])
-            else:
-                switch_middle_panel_view("text", "No text channels available")
+        if sio_client and sio_client.connected:
+            try:
+                await sio_client.emit('leave_voice_channel', {'channel_id': channel_id_being_left})
+            except Exception as e:
+                print(f"Error emitting leave_voice_channel: {e}")
 
+        is_actively_in_voice_channel = False
+        # current_voice_channel_id is now None (no longer *active* in it)
+        # previewing_voice_channel_id remains channel_id_being_left (we return to previewing it)
+        previewing_voice_channel_id = channel_id_being_left 
+        current_voice_channel_id = None # Explicitly set to None as we are no longer *active*
+
+        if active_page_controls.get('current_voice_channel_text'):
+            active_page_controls['current_voice_channel_text'].value = f"Preview: {channel_name_being_left}"
+            active_page_controls['current_voice_channel_text'].update()
+        
+        # User list (current_voice_channel_active_users) should ideally remain as it was for the preview.
+        # Server's voice_channel_users (if re-requested or resent on join) would repopulate.
+        # For now, update_voice_channel_user_list_ui will use existing data but change button visibility.
+        update_voice_channel_user_list_ui() 
+        
         if hasattr(page_ref, 'update'): page_ref.update()
+        print(f"Returned to preview mode for voice channel: {channel_name_being_left}")
 
     async def fetch_and_display_channels(p: ft.Page):
         global text_channels_data, voice_channels_data
