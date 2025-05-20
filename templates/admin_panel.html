@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="admin-panel-container">
+    <h2>管理员面板</h2>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <div class="flash-message {{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+
+    <!-- 用户管理 -->
+    <div class="admin-section">
+        <h3>用户管理</h3>
+        {% if users %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>用户名</th>
+                        <th>管理员</th>
+                        <th>创建日期</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for user_item in users %}
+                    <tr>
+                        <td>{{ user_item.id }}</td>
+                        <td>{{ user_item.username }}</td>
+                        <td>{{ '是' if user_item.is_admin else '否' }}</td>
+                        <td>{{ user_item.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                        <td>
+                            {% if current_user.id != user_item.id %} {# 管理员不能修改自己的管理员状态 #}
+                                {% if user_item.is_admin %}
+                                    <a href="{{ url_for('toggle_admin_status', user_id=user_item.id) }}" class="btn-sm btn-demote">取消管理员</a>
+                                {% else %}
+                                    <a href="{{ url_for('toggle_admin_status', user_id=user_item.id) }}" class="btn-sm btn-promote">设为管理员</a>
+                                {% endif %}
+                            {% else %}
+                                (自己)
+                            {% endif %}
+                            <button class="btn-sm btn-delete" onclick="confirmDeleteUser({{ user_item.id }}, '{{ user_item.username }}')">删除</button>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p>没有用户。</p>
+        {% endif %}
+    </div>
+
+    <!-- 频道管理 -->
+    <div class="admin-section">
+        <h3>频道管理</h3>
+        <a href="{{ url_for('create_channel') }}" class="btn btn-create-channel">创建新频道</a>
+        {% if channels %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>频道名称</th>
+                        <th>类型</th>
+                        <th>创建日期</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for channel_item in channels %}
+                    <tr>
+                        <td>{{ channel_item.id }}</td>
+                        <td>{{ channel_item.name }}</td>
+                        <td>{{ '文字' if channel_item.channel_type == 'text' else '语音' }}</td>
+                        <td>{{ channel_item.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                        <td>
+                            <a href="{{ url_for('edit_channel', channel_id=channel_item.id) }}" class="btn-sm btn-edit">编辑</a>
+                            <button class="btn-sm btn-delete" onclick="confirmDeleteChannel({{ channel_item.id }}, '{{ channel_item.name }}')">删除</button>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p>没有频道。</p>
+        {% endif %}
+    </div>
+
+</div>
+
+<script>
+function confirmDeleteUser(userId, username) {
+    if (confirm(`确定要删除用户 "${username}" (ID: ${userId}) 吗？此操作无法撤销。`)) {
+        window.location.href = `/admin/user/${userId}/delete`; // 需要创建此路由
+    }
+}
+
+function confirmDeleteChannel(channelId, channelName) {
+    if (confirm(`确定要删除频道 "${channelName}" (ID: ${channelId}) 吗？此操作无法撤销。`)) {
+        window.location.href = `/admin/channel/${channelId}/delete`; // 需要创建此路由
+    }
+}
+</script>
+
+{% endblock %} 

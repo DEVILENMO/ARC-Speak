@@ -1,0 +1,280 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="settings-container">
+    <h2>用户设置</h2>
+    
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <div class="flash-message {{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+    
+    <form method="POST" action="{{ url_for('settings') }}">
+        {{ form.hidden_tag() }}
+        
+        <div class="form-group">
+            <label class="form-label">用户名</label>
+            <div class="current-value">{{ current_user.username }}</div>
+        </div>
+
+        <div class="form-group">
+            {{ form.avatar_url.label(class="form-label") }}
+            {{ form.avatar_url(class="form-control", placeholder="输入头像URL") }}
+            {% if form.avatar_url.errors %}
+                <div class="error-messages">
+                    {% for error in form.avatar_url.errors %}
+                        <span class="error-message">{{ error }}</span>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        </div>
+        
+        <div class="form-group">
+            <label class="form-label">当前音量 (本地设置)</label>
+            <input type="range" id="volume-slider" min="0" max="100" value="100">
+            <span id="volume-value">100%</span>
+        </div>
+
+        <div class="settings-divider"></div>
+        <h3>设备管理</h3>
+
+        <div class="form-group">
+            <label for="audio-input-select" class="form-label">输入设备 (麦克风):</label>
+            <select id="audio-input-select" class="form-control"></select>
+        </div>
+
+        <div class="form-group">
+            <label for="audio-output-select" class="form-label">输出设备 (扬声器/耳机):</label>
+            <select id="audio-output-select" class="form-control"></select>
+        </div>
+        
+        <div class="form-group">
+            <button type="button" id="test-mic-button" class="btn">测试麦克风</button>
+            <button type="button" id="stop-test-mic-button" class="btn" style="display:none;">停止测试</button>
+            <p id="mic-test-status" class="mic-test-status-text"></p>
+        </div>
+        <div class="settings-divider"></div>
+        
+        <div class="form-group">
+            {{ form.auto_join_voice.label(class="form-label") }}
+            {{ form.auto_join_voice(class="form-checkbox") }}
+            {% if form.auto_join_voice.errors %}
+                <div class="error-messages">
+                    {% for error in form.auto_join_voice.errors %}
+                        <span class="error-message">{{ error }}</span>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        </div>
+        
+        <div class="form-actions">
+            {{ form.submit(class="btn btn-save") }}
+        </div>
+    </form>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const volumeSlider = document.getElementById('volume-slider');
+    const volumeValue = document.getElementById('volume-value');
+    const audioInputSelect = document.getElementById('audio-input-select');
+    const audioOutputSelect = document.getElementById('audio-output-select');
+    const testMicButton = document.getElementById('test-mic-button');
+    const stopTestMicButton = document.getElementById('stop-test-mic-button');
+    const micTestStatus = document.getElementById('mic-test-status');
+
+    let localStream = null;
+    let audioContext = null;
+    let source = null;
+
+    if (volumeSlider && volumeValue) {
+        // 从本地存储加载音量设置
+        const savedVolume = localStorage.getItem('volume');
+        if (savedVolume) {
+            volumeSlider.value = savedVolume;
+            volumeValue.textContent = savedVolume + '%';
+        } else {
+            // 如果localStorage中没有，则使用默认值或滑块的当前值进行初始化
+            volumeValue.textContent = volumeSlider.value + '%';
+        }
+
+        volumeSlider.addEventListener('input', function(e) {
+            volumeValue.textContent = e.target.value + '%';
+            // 保存到本地存储
+            localStorage.setItem('volume', e.target.value);
+        });
+    }
+
+    async function getMediaDevices() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+            console.warn("enumerateDevices() not supported.");
+            micTestStatus.textContent = "浏览器不支持设备枚举。";
+            return;
+        }
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            audioInputSelect.innerHTML = ''; // Clear existing options
+            audioOutputSelect.innerHTML = '';
+
+            // Add a default option for system default
+            const defaultInputOption = document.createElement('option');
+            defaultInputOption.value = 'default';
+            defaultInputOption.text = '默认输入设备';
+            audioInputSelect.appendChild(defaultInputOption);
+
+            const defaultOutputOption = document.createElement('option');
+            defaultOutputOption.value = 'default';
+            defaultOutputOption.text = '默认输出设备';
+            audioOutputSelect.appendChild(defaultOutputOption);
+            
+            devices.forEach(device => {
+                const option = document.createElement('option');
+                option.value = device.deviceId;
+                if (device.kind === 'audioinput') {
+                    if (device.deviceId === "") { // Skip if deviceId is empty (can happen)
+                        option.text = device.label || `麦克风 ${audioInputSelect.length}`;
+                        option.value = `audioinput_label_${audioInputSelect.length}`; // Create a unique value based on label if ID is empty
+                    } else {
+                         option.text = device.label || `麦克风 ${audioInputSelect.length} (${device.deviceId.substring(0,8)})`;
+                    }
+                    audioInputSelect.appendChild(option);
+                } else if (device.kind === 'audiooutput') {
+                     if (device.deviceId === "") {
+                        option.text = device.label || `扬声器 ${audioOutputSelect.length}`;
+                        option.value = `audiooutput_label_${audioOutputSelect.length}`;
+                    } else {
+                        option.text = device.label || `扬声器 ${audioOutputSelect.length} (${device.deviceId.substring(0,8)})`;
+                    }
+                    audioOutputSelect.appendChild(option);
+                }
+            });
+
+            // Load saved preferences
+            const savedInputDevice = localStorage.getItem('selectedAudioInput');
+            if (savedInputDevice && Array.from(audioInputSelect.options).some(opt => opt.value === savedInputDevice)) {
+                audioInputSelect.value = savedInputDevice;
+            }
+            const savedOutputDevice = localStorage.getItem('selectedAudioOutput');
+            // For output devices, we can't directly set them for playback in all browsers without specific APIs
+            // like setSinkId (which requires user gesture and might not be universally supported or simple for this context).
+            // So we'll save the preference, but applying it for the mic test will use default output.
+            // If the main application needs to set output, it'll need more complex handling.
+            if (savedOutputDevice && Array.from(audioOutputSelect.options).some(opt => opt.value === savedOutputDevice)) {
+                audioOutputSelect.value = savedOutputDevice;
+            }
+            
+        } catch (err) {
+            console.error('Error enumerating devices:', err);
+            micTestStatus.textContent = "获取设备列表失败: " + err.message;
+        }
+    }
+
+    if (audioInputSelect && audioOutputSelect) {
+        getMediaDevices(); // Populate devices on load
+
+        audioInputSelect.addEventListener('change', function() {
+            localStorage.setItem('selectedAudioInput', this.value);
+            // If a test is ongoing, restarting it with the new device might be complex.
+            // For now, selection change doesn't auto-restart test.
+        });
+
+        audioOutputSelect.addEventListener('change', function() {
+            localStorage.setItem('selectedAudioOutput', this.value);
+            // Note: Changing output device selection here won't magically reroute audio from an ongoing
+            // getUserMedia stream without using setSinkId() on the audio/video element if available.
+            // The mic test will use the system default output or the one selected when test starts if feasible.
+        });
+    }
+
+    // Microphone Test Logic
+    if (testMicButton && stopTestMicButton && micTestStatus && audioInputSelect) {
+        testMicButton.addEventListener('click', async () => {
+            if (localStream) { // If a stream already exists, stop it first
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            if (audioContext) {
+                await audioContext.close();
+                audioContext = null;
+            }
+
+            const selectedDeviceId = audioInputSelect.value;
+            const constraints = {
+                audio: { 
+                    deviceId: selectedDeviceId !== 'default' ? { exact: selectedDeviceId } : undefined
+                }
+            };
+
+            micTestStatus.textContent = "正在请求麦克风权限...";
+            testMicButton.disabled = true;
+            stopTestMicButton.style.display = 'none';
+
+
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia(constraints);
+                micTestStatus.textContent = "麦克风已连接，请说话...";
+                testMicButton.style.display = 'none';
+                stopTestMicButton.style.display = 'inline-block';
+                stopTestMicButton.disabled = false;
+
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                source = audioContext.createMediaStreamSource(localStream);
+                
+                // Output to default device. For specific output device, setSinkId would be needed on an <audio> element.
+                // For direct loopback, connecting to destination is standard.
+                source.connect(audioContext.destination);
+
+            } catch (err) {
+                console.error('Error accessing microphone:', err);
+                micTestStatus.textContent = "麦克风访问失败: " + err.message;
+                if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+                     micTestStatus.textContent = "麦克风访问失败: 未找到选定的设备。请检查连接或尝试其他设备。";
+                } else if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+                    micTestStatus.textContent = "麦克风访问失败: 未授予权限。请在浏览器设置中允许麦克风访问。";
+                } else {
+                    micTestStatus.textContent = "麦克风访问失败: " + err.message;
+                }
+                testMicButton.disabled = false;
+                testMicButton.style.display = 'inline-block';
+                stopTestMicButton.style.display = 'none';
+            }
+        });
+
+        stopTestMicButton.addEventListener('click', () => {
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            if (source) {
+                source.disconnect();
+                source = null;
+            }
+            if (audioContext) {
+                audioContext.close().then(() => audioContext = null);
+            }
+            micTestStatus.textContent = "麦克风测试已停止。";
+            testMicButton.disabled = false;
+            testMicButton.style.display = 'inline-block';
+            stopTestMicButton.style.display = 'none';
+        });
+    }
+    
+    // Auto-join voice preference might be handled by the form now, 
+    // but if you want to keep localStorage sync for immediate effect without page reload (not typical for this kind of setting):
+    const autoJoinCheckbox = document.getElementById('auto_join_voice'); // Assuming ID from form field
+    if (autoJoinCheckbox) {
+        // Example: if you wanted to sync it with localStorage for some reason
+        // const savedAutoJoin = localStorage.getItem('autoJoinVoice');
+        // if (savedAutoJoin !== null) {
+        //     autoJoinCheckbox.checked = savedAutoJoin === 'true';
+        // }
+        // autoJoinCheckbox.addEventListener('change', function(e) {
+        //     localStorage.setItem('autoJoinVoice', e.target.checked);
+        // });
+    }
+});
+</script>
+{% endblock %} 
