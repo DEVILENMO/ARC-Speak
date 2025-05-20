@@ -5,6 +5,31 @@ import ssl
 import json # For saving/loading config
 import os # For checking config file existence
 import inspect # For checking if a function is a coroutine
+import asyncio # For running sync code in thread
+import threading # For audio processing thread
+import numpy as np # For RMS calculation
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except Exception as e:
+    print(f"Sounddevice library not found or failed to import: {e}. Audio device listing will be unavailable.")
+    SOUNDDEVICE_AVAILABLE = False
+    sd = None # Ensure sd is defined
+
+# --- Color Palette ---
+COLOR_PRIMARY_PURPLE = ft.Colors.DEEP_PURPLE
+COLOR_TEXT_DARK_PURPLE = ft.Colors.DEEP_PURPLE_900 # New very dark purple for text
+COLOR_TEXT_ON_PURPLE = ft.Colors.WHITE
+COLOR_BACKGROUND_WHITE = ft.Colors.WHITE
+COLOR_TEXT_ON_WHITE = COLOR_TEXT_DARK_PURPLE # Changed from ft.Colors.BLACK
+COLOR_BORDER = COLOR_TEXT_DARK_PURPLE        # Changed from ft.Colors.BLACK
+COLOR_DIVIDER_ON_WHITE = ft.Colors.GREY_300
+COLOR_DIVIDER_ON_PURPLE = ft.Colors.with_opacity(0.5, ft.Colors.WHITE)
+COLOR_INPUT_FIELD_BG_FILLED = ft.Colors.with_opacity(0.05, COLOR_PRIMARY_PURPLE) # Subtle purple tint
+COLOR_ICON_ON_WHITE = COLOR_TEXT_DARK_PURPLE # Changed from ft.Colors.BLACK
+COLOR_ICON_ON_PURPLE = ft.Colors.WHITE
+COLOR_BUTTON_TEXT = ft.Colors.WHITE 
+COLOR_STATUS_TEXT_MUTED = ft.Colors.GREY_600
 
 # --- Configuration ---
 SERVER_ADDRESS = "47.103.156.181"
@@ -22,6 +47,17 @@ current_text_channel_id = None
 current_voice_channel_id = None # ID of the voice channel user is actively (confirmed) in
 previewing_voice_channel_id = None # ID of voice channel being previewed
 is_actively_in_voice_channel = False # Has user clicked "Confirm Join"?
+is_mic_muted = False # Added global state for mic mute
+selected_input_device_id = None # Added
+selected_output_device_id = None # Added
+
+# Mic Test Specific Globals
+is_mic_testing = False 
+current_mic_test_volume: float = 0.0
+mic_test_volume_lock = threading.Lock()
+mic_test_thread: threading.Thread = None
+mic_test_stop_event = threading.Event()
+mic_test_ui_update_task: asyncio.Task = None
 
 text_channels_data = {} 
 voice_channels_data = {} 
@@ -41,13 +77,102 @@ def save_config(config_data):
         with open(CONFIG_FILE, 'w') as f: json.dump(config_data, f, indent=4)
     except IOError: pass
 
+# --- Audio Device Helper (Sync) ---
+def _get_audio_devices_sync():
+    if not SOUNDDEVICE_AVAILABLE or sd is None:
+        return [], [] # Return empty lists if sounddevice is not available
+    try:
+        devices = sd.query_devices()
+        input_devices = []
+        output_devices = []
+        default_input_idx = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+        default_output_idx = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+
+        for i, device in enumerate(devices):
+            device_name = f"{device['name']} ({sd.query_hostapis(device['hostapi'])['name']})"
+            if i == default_input_idx and device['max_input_channels'] > 0:
+                # Prepend '(Default)' to the default input device name
+                input_devices.insert(0, {'id': i, 'name': f"(Default) {device_name}"})
+            elif device['max_input_channels'] > 0:
+                input_devices.append({'id': i, 'name': device_name})
+            
+            if i == default_output_idx and device['max_output_channels'] > 0:
+                 # Prepend '(Default)' to the default output device name
+                output_devices.insert(0, {'id': i, 'name': f"(Default) {device_name}"})
+            elif device['max_output_channels'] > 0:
+                output_devices.append({'id': i, 'name': device_name})
+        
+        # Ensure the default marked item is truly at the top if it wasn't added first due to iteration order
+        # This is a bit redundant given the insert(0,...) logic but as a safeguard.
+        input_devices.sort(key=lambda x: not x['name'].startswith('(Default)'))
+        output_devices.sort(key=lambda x: not x['name'].startswith('(Default)'))
+
+        return input_devices, output_devices
+    except Exception as e:
+        print(f"Error querying audio devices: {e}")
+        return [], [] # Return empty on error
+
+# --- Mic Test Audio Processing (Run in a separate thread) ---
+def _mic_test_audio_callback(indata, outdata, frames, time, status):
+    global current_mic_test_volume, mic_test_volume_lock
+    if status:
+        print(f"Mic Test Callback Status: {status}")
+    outdata[:] = indata # Loopback
+    volume_norm = np.linalg.norm(indata) * 10 # Arbitrary scaling for better visibility
+    with mic_test_volume_lock:
+        current_mic_test_volume = min(1.0, volume_norm) # Cap at 1.0 for progress bar
+
+def _run_mic_test_loop(page_instance: ft.Page, input_dev_id: int, output_dev_id: int, stop_event: threading.Event):
+    global current_mic_test_volume, mic_test_volume_lock
+    stream = None
+    try:
+        samplerate = sd.query_devices(input_dev_id, 'input')['default_samplerate']
+        # If output_dev_id is None, sounddevice will try to use the system default output.
+        stream = sd.Stream(
+            device=(input_dev_id, output_dev_id),
+            samplerate=samplerate,
+            channels=1, # Mono for simplicity
+            callback=_mic_test_audio_callback,
+            blocksize=0 # Let sounddevice choose, or specify (e.g., 1024)
+        )
+        stream.start()
+        print("Mic test audio stream started.")
+        while not stop_event.is_set():
+            sd.sleep(100) # Keep thread alive while stream is running, check stop event periodically
+        print("Mic test stop event received.")
+
+    except Exception as e:
+        print(f"Error in mic test audio loop: {e}")
+        error_message = f"Mic Test Error: {str(e)[:50]}..."
+        async def show_error_async(): # Helper to call async method from thread
+            sb = ft.SnackBar(ft.Text(error_message, color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.RED_ACCENT_700, open=True)
+            page_instance.overlay.append(sb)
+            page_instance.update()
+        if page_instance: # Check if page_instance is valid
+             asyncio.run_coroutine_threadsafe(show_error_async(), page_instance.loop)       
+
+    finally:
+        if stream:
+            try:
+                stream.stop()
+                stream.close()
+                print("Mic test audio stream stopped and closed.")
+            except Exception as e:
+                print(f"Error stopping/closing mic test stream: {e}")
+        with mic_test_volume_lock:
+            current_mic_test_volume = 0.0 # Reset volume on stop
+        print("Mic test loop finished.")
+
 # --- Main Application Logic ---
 async def main(page: ft.Page):
     page.title = "Voice/Text Chat Client"
     page.padding = 0
+    page.bgcolor = COLOR_BACKGROUND_WHITE # Global page background
+    page.theme_mode = ft.ThemeMode.LIGHT # Explicitly set to light
     app_config = load_config()
 
-    global sio_client, shared_aiohttp_session
+    global sio_client, shared_aiohttp_session, selected_input_device_id, selected_output_device_id
+    global is_mic_testing, mic_test_thread, mic_test_stop_event, mic_test_ui_update_task, current_mic_test_volume, mic_test_volume_lock
     custom_ssl_context = ssl.create_default_context()
     custom_ssl_context.check_hostname = False
     custom_ssl_context.verify_mode = ssl.CERT_NONE
@@ -94,10 +219,10 @@ async def main(page: ft.Page):
             is_speaking_active = is_actively_in_voice_channel and user_data.get('speaking', False)
             speaking_indicator = ft.Icon(
                 name=ft.Icons.RECORD_VOICE_OVER if is_speaking_active else ft.Icons.VOICE_OVER_OFF,
-                color=ft.Colors.GREEN_ACCENT_700 if is_speaking_active else ft.Colors.GREY,
+                color=ft.Colors.GREEN_ACCENT_700 if is_speaking_active else COLOR_STATUS_TEXT_MUTED, # Keep green for speaking, muted for off
                 size=16
             )
-            vc_user_controls.append(ft.Row([speaking_indicator, ft.Text(user_data.get('username', 'Unknown'))], alignment=ft.MainAxisAlignment.START, spacing=5))
+            vc_user_controls.append(ft.Row([speaking_indicator, ft.Text(user_data.get('username', 'Unknown'), color=COLOR_TEXT_ON_WHITE)], alignment=ft.MainAxisAlignment.START, spacing=5))
         vc_users_list_ctrl.controls = vc_user_controls
         if hasattr(vc_users_list_ctrl, 'update'): vc_users_list_ctrl.update()
 
@@ -106,6 +231,7 @@ async def main(page: ft.Page):
             ch_name = voice_channels_data[previewing_voice_channel_id]['name']
             prefix = "Voice:" if is_actively_in_voice_channel else "Preview:"
             topic_display.value = f"{prefix} {ch_name}"
+            # topic_display.color = COLOR_TEXT_ON_WHITE # Already handled as it's part of middle panel
             if hasattr(topic_display, 'update'): topic_display.update()
         update_voice_panel_button_visibility() # Ensure buttons are correct state
 
@@ -128,7 +254,13 @@ async def main(page: ft.Page):
     @sio_client.event
     async def new_message(data):
         if data.get('channel_id') == current_text_channel_id and active_page_controls.get('chat_messages_view'):
-            active_page_controls['chat_messages_view'].controls.append(ft.Text(f"[{data.get('timestamp')}] {data.get('username')}: {data.get('content')}", selectable=True, font_family="Consolas"))
+            active_page_controls['chat_messages_view'].controls.append(
+                ft.Text(f"[{data.get('timestamp')}] {data.get('username')}: {data.get('content')}", 
+                        selectable=True, 
+                        font_family="Consolas", 
+                        color=COLOR_TEXT_ON_WHITE # Explicitly set text color for messages
+                       ) 
+            )
             active_page_controls['chat_messages_view'].update()
 
     @sio_client.event
@@ -176,12 +308,299 @@ async def main(page: ft.Page):
         global all_server_users
         all_server_users = data
         if active_page_controls.get('server_users_list_view'):
-            controls = [ft.Row([ft.Icon(name=ft.Icons.CIRCLE, color=ft.Colors.GREEN_ACCENT_700, size=10), ft.Text(u.get('username','N/A'))], alignment=ft.MainAxisAlignment.START, spacing=5) for u in sorted(all_server_users, key=lambda u: u.get('username', '').lower())]
+            controls = [ft.Row([ft.Icon(name=ft.Icons.CIRCLE, color=ft.Colors.GREEN_ACCENT_700, size=10), ft.Text(u.get('username','N/A'), color=COLOR_TEXT_ON_WHITE)], alignment=ft.MainAxisAlignment.START, spacing=5) for u in sorted(all_server_users, key=lambda u: u.get('username', '').lower())]
             active_page_controls['server_users_list_view'].controls = controls
             active_page_controls['server_users_list_view'].update()
 
-    active_page_controls['status_text'] = ft.Text()
-    remember_me_checkbox = ft.Checkbox(label="记住我", value=app_config.get("remember_me", False))
+    async def _update_mic_test_bar_task_loop():
+        global is_mic_testing, current_mic_test_volume, mic_test_volume_lock
+        mic_test_bar = active_page_controls.get('voice_settings_mic_test_bar')
+        if not mic_test_bar:
+            return
+        print("Mic test UI update loop started.")
+        try:
+            while is_mic_testing:
+                with mic_test_volume_lock:
+                    volume = current_mic_test_volume
+                mic_test_bar.value = volume
+                if hasattr(mic_test_bar, "update"): mic_test_bar.update()
+                await asyncio.sleep(0.05) # Update roughly 20 times per second
+        except asyncio.CancelledError:
+            print("Mic test UI update loop cancelled.")
+        finally:
+            if mic_test_bar: # Reset bar on exit
+                mic_test_bar.value = 0
+                if hasattr(mic_test_bar, "update"): mic_test_bar.update()
+            print("Mic test UI update loop finished.")
+
+    async def populate_audio_device_dropdowns():
+        global selected_input_device_id, selected_output_device_id, page # Added page
+        print("Attempting to populate audio device dropdowns...")
+        input_dropdown = active_page_controls.get('voice_settings_input_device_dropdown')
+        output_dropdown = active_page_controls.get('voice_settings_output_device_dropdown')
+
+        if not input_dropdown or not output_dropdown:
+            print("Audio dropdown controls not found.")
+            return
+
+        current_config = load_config()
+        saved_input_id = current_config.get("saved_input_device_id")
+        saved_output_id = current_config.get("saved_output_device_id")
+        print(f"Loaded saved device IDs - Input: {saved_input_id}, Output: {saved_output_id}")
+
+        # Convert saved IDs to int if they exist, None otherwise. This is crucial.
+        # The IDs from sounddevice are integers. Storing them as int and comparing as int.
+        if saved_input_id is not None:
+            try:
+                saved_input_id = int(saved_input_id)
+            except ValueError:
+                print(f"Warning: Could not convert saved_input_device_id '{saved_input_id}' to int. Ignoring.")
+                saved_input_id = None
+        
+        if saved_output_id is not None:
+            try:
+                saved_output_id = int(saved_output_id)
+            except ValueError:
+                print(f"Warning: Could not convert saved_output_device_id '{saved_output_id}' to int. Ignoring.")
+                saved_output_id = None
+
+        if not SOUNDDEVICE_AVAILABLE:
+            input_dropdown.options = [ft.dropdown.Option(key="-1", text="Audio N/A - Check Install")]
+            output_dropdown.options = [ft.dropdown.Option(key="-1", text="Audio N/A - Check Install")]
+            input_dropdown.value = "-1"
+            output_dropdown.value = "-1"
+            selected_input_device_id = None # Explicitly set global state
+            selected_output_device_id = None # Explicitly set global state
+            if hasattr(page, 'update'): page.update()
+            return
+
+        try:
+            input_devices, output_devices = await asyncio.to_thread(_get_audio_devices_sync)
+            print(f"Input devices found: {len(input_devices)}")
+            print(f"Output devices found: {len(output_devices)}")
+
+            input_dropdown.options.clear()
+            applied_saved_input = False
+            if not input_devices:
+                input_dropdown.options.append(ft.dropdown.Option(key="-1", text="No Input Devices Found"))
+                input_dropdown.value = "-1"
+                selected_input_device_id = None
+            else:
+                for device in input_devices:
+                    # Device IDs from sounddevice are integers. Store keys as strings for dropdown.
+                    input_dropdown.options.append(ft.dropdown.Option(key=str(device['id']), text=device['name']))
+                
+                # Try to apply saved ID
+                if saved_input_id is not None and any(device['id'] == saved_input_id for device in input_devices):
+                    input_dropdown.value = str(saved_input_id)
+                    selected_input_device_id = saved_input_id # Store as int
+                    applied_saved_input = True
+                    print(f"Applied saved input device ID: {saved_input_id}")
+                
+                if not applied_saved_input: # Fallback to default or first
+                    default_input = next((d for d in input_devices if d['name'].startswith("(Default)")), None)
+                    if default_input:
+                        input_dropdown.value = str(default_input['id'])
+                        selected_input_device_id = default_input['id'] # Store as int
+                    elif input_devices: 
+                        input_dropdown.value = str(input_devices[0]['id'])
+                        selected_input_device_id = input_devices[0]['id'] # Store as int
+                    print(f"Default/fallback input device ID: {selected_input_device_id}")
+            
+            output_dropdown.options.clear()
+            applied_saved_output = False
+            if not output_devices:
+                output_dropdown.options.append(ft.dropdown.Option(key="-1", text="No Output Devices Found"))
+                output_dropdown.value = "-1"
+                selected_output_device_id = None
+            else:
+                for device in output_devices:
+                    output_dropdown.options.append(ft.dropdown.Option(key=str(device['id']), text=device['name']))
+
+                if saved_output_id is not None and any(device['id'] == saved_output_id for device in output_devices):
+                    output_dropdown.value = str(saved_output_id)
+                    selected_output_device_id = saved_output_id # Store as int
+                    applied_saved_output = True
+                    print(f"Applied saved output device ID: {saved_output_id}")
+
+                if not applied_saved_output: # Fallback to default or first
+                    default_output = next((d for d in output_devices if d['name'].startswith("(Default)")), None)
+                    if default_output:
+                        output_dropdown.value = str(default_output['id'])
+                        selected_output_device_id = default_output['id'] # Store as int
+                    elif output_devices: 
+                        output_dropdown.value = str(output_devices[0]['id'])
+                        selected_output_device_id = output_devices[0]['id'] # Store as int
+                    print(f"Default/fallback output device ID: {selected_output_device_id}")
+
+        except Exception as e:
+            print(f"Error populating audio dropdowns: {e}")
+            input_dropdown.options = [ft.dropdown.Option(key="-1", text="Error Loading Devices")]
+            output_dropdown.options = [ft.dropdown.Option(key="-1", text="Error Loading Devices")]
+            input_dropdown.value = "-1"; selected_input_device_id = None
+            output_dropdown.value = "-1"; selected_output_device_id = None
+
+        if hasattr(input_dropdown, 'update'): input_dropdown.update()
+        if hasattr(output_dropdown, 'update'): output_dropdown.update()
+        if hasattr(page, 'update'): page.update() # Ensure page is accessible here
+
+    async def handle_save_audio_settings_click(e):
+        global selected_input_device_id, selected_output_device_id, page # Added page
+        current_config = load_config()
+        
+        # Ensure IDs are integers for saving, or None
+        input_id_to_save = int(selected_input_device_id) if selected_input_device_id is not None else None
+        output_id_to_save = int(selected_output_device_id) if selected_output_device_id is not None else None
+
+        if input_id_to_save is not None:
+            current_config["saved_input_device_id"] = input_id_to_save
+        else: 
+            current_config.pop("saved_input_device_id", None)
+            
+        if output_id_to_save is not None:
+            current_config["saved_output_device_id"] = output_id_to_save
+        else:
+            current_config.pop("saved_output_device_id", None)
+
+        save_config(current_config)
+        print(f"Audio settings saved. Input ID: {input_id_to_save}, Output ID: {output_id_to_save}")
+        
+        if hasattr(page, 'overlay'): # Check if page and overlay are available
+            sb = ft.SnackBar(
+                ft.Text("Audio settings saved!", color=COLOR_TEXT_ON_WHITE),
+                bgcolor=ft.Colors.with_opacity(0.8, COLOR_PRIMARY_PURPLE),
+                open=True
+            )
+            page.overlay.append(sb)
+            page.update()
+        else:
+            print("Page or page.overlay not available for SnackBar.")
+
+    async def handle_input_device_change(e):
+        global selected_input_device_id, is_mic_testing
+        selected_input_device_id = int(e.control.value) if e.control.value and e.control.value != "-1" else None
+        print(f"Selected Input Device ID: {selected_input_device_id}")
+        if is_mic_testing: 
+            await handle_mic_test_button_click(None) 
+
+    async def handle_output_device_change(e):
+        global selected_output_device_id, is_mic_testing
+        selected_output_device_id = int(e.control.value) if e.control.value and e.control.value != "-1" else None
+        print(f"Selected Output Device ID: {selected_output_device_id}")
+        if is_mic_testing: 
+            await handle_mic_test_button_click(None)
+
+    async def handle_mute_mic_click(e): 
+        global is_mic_muted, current_voice_channel_id, sio_client
+        is_mic_muted = not is_mic_muted
+        
+        mute_button = active_page_controls.get('voice_settings_mute_button')
+        if mute_button:
+            mute_button.icon = ft.Icons.MIC_OFF if is_mic_muted else ft.Icons.MIC
+            mute_button.tooltip = "Unmute Microphone" if is_mic_muted else "Mute Microphone"
+            mute_button.update()
+
+        print(f"Mic muted state: {is_mic_muted}")
+
+        if is_mic_muted and sio_client and sio_client.connected and current_voice_channel_id is not None:
+            try:
+                await sio_client.emit('user_speaking_status', {
+                    'channel_id': current_voice_channel_id, 
+                    'speaking': False 
+                })
+                print(f"Emitted user_speaking_status (false) due to mute for channel {current_voice_channel_id}")
+            except Exception as ex:
+                print(f"Error emitting user_speaking_status on mute: {ex}")
+        
+        if hasattr(page, 'update'): page.update()
+
+    async def handle_mic_test_button_click(e):
+        global is_mic_testing, selected_input_device_id, selected_output_device_id, mic_test_thread, mic_test_stop_event, mic_test_ui_update_task
+        
+        mic_test_btn = active_page_controls.get('voice_settings_mic_test_button')
+        mic_test_bar = active_page_controls.get('voice_settings_mic_test_bar')
+
+        if not mic_test_btn or not mic_test_bar:
+            print("Mic test UI elements not found.")
+            return
+
+        if is_mic_testing: # If currently testing, stop it
+            print("Attempting to stop mic test...")
+            is_mic_testing = False # Signal UI loop to stop
+            mic_test_stop_event.set() # Signal audio thread to stop
+            
+            if mic_test_ui_update_task and not mic_test_ui_update_task.done():
+                mic_test_ui_update_task.cancel()
+                try:
+                    await mic_test_ui_update_task # Allow cancellation to complete
+                except asyncio.CancelledError:
+                    print("Mic test UI update task successfully cancelled.")
+            mic_test_ui_update_task = None
+
+            if mic_test_thread and mic_test_thread.is_alive():
+                print("Waiting for mic test audio thread to join...")
+                mic_test_thread.join(timeout=1.0) # Wait for thread to finish
+                if mic_test_thread.is_alive():
+                    print("Warning: Mic test audio thread did not join in time.")
+            mic_test_thread = None
+            
+            mic_test_btn.text = "Start Mic Test"
+            mic_test_btn.icon = ft.Icons.PLAY_ARROW
+            mic_test_bar.value = 0
+            print("Mic test stopped.")
+        else: # If not testing, start it
+            if not SOUNDDEVICE_AVAILABLE:
+                sb = ft.SnackBar(ft.Text("Sounddevice library not available. Mic test disabled.", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.RED_ACCENT_700, open=True)
+                page.overlay.append(sb)
+                page.update()
+                return
+
+            if selected_input_device_id is None:
+                sb = ft.SnackBar(ft.Text("Please select an input device first.", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.with_opacity(0.8, COLOR_PRIMARY_PURPLE),open=True)
+                page.overlay.append(sb)
+                page.update()
+                return
+            
+            current_output_dev_id = selected_output_device_id
+            if current_output_dev_id is None: # Try to get default output if none selected
+                _, output_devices = _get_audio_devices_sync() # This is a sync call, but quick for this check
+                default_output = next((d for d in output_devices if d['name'].startswith("(Default)")), None)
+                if default_output:
+                    current_output_dev_id = default_output['id']
+                    print(f"Using default output device for mic test: {default_output['name']}")
+                elif output_devices: # Fallback to first available if no explicit default
+                    current_output_dev_id = output_devices[0]['id']
+                    print(f"Using first available output device for mic test: {output_devices[0]['name']}")
+                else:
+                    sb = ft.SnackBar(ft.Text("No output device available for mic test loopback.", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.RED_ACCENT_700,open=True)
+                    page.overlay.append(sb)
+                    page.update()
+                    return
+
+            is_mic_testing = True
+            mic_test_stop_event.clear()
+            mic_test_btn.text = "Stop Mic Test"
+            mic_test_btn.icon = ft.Icons.STOP
+            print(f"Starting mic test for input: {selected_input_device_id}, output: {current_output_dev_id}.")
+            
+            # Pass the current page instance to the thread for UI updates (errors)
+            mic_test_thread = threading.Thread(target=_run_mic_test_loop, args=(page, selected_input_device_id, current_output_dev_id, mic_test_stop_event))
+            mic_test_thread.daemon = True # Allow main program to exit even if thread is running
+            mic_test_thread.start()
+
+            if mic_test_ui_update_task is None or mic_test_ui_update_task.done():
+                mic_test_ui_update_task = asyncio.create_task(_update_mic_test_bar_task_loop())
+            else:
+                print("Mic test UI update task seems to be already running or not None.")
+
+        if hasattr(mic_test_btn, 'update'): mic_test_btn.update()
+        if hasattr(mic_test_bar, 'update'): mic_test_bar.update() 
+        # page.update() # May not be strictly needed if individual controls update
+
+    active_page_controls['status_text'] = ft.Text(color=COLOR_STATUS_TEXT_MUTED) # Muted status text
+    remember_me_checkbox = ft.Checkbox(label="记住我", value=app_config.get("remember_me", False),
+                                        check_color=COLOR_PRIMARY_PURPLE,
+                                        label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE))
 
     async def _leave_current_voice_channel_if_any(page_ref: ft.Page, switch_to_text: bool = False, new_text_channel_id = None, new_text_channel_name = "Select a text channel"):
         global current_voice_channel_id, previewing_voice_channel_id, is_actively_in_voice_channel, current_voice_channel_active_users
@@ -273,19 +692,46 @@ async def main(page: ft.Page):
 
     async def handle_leave_voice_click(page_ref: ft.Page):
         # This button is only visible if is_actively_in_voice_channel is True
-        global current_text_channel_id
-        # Determine which text channel to switch back to
-        target_text_channel_id, target_text_channel_name = None, "Select a text channel"
-        if current_text_channel_id and text_channels_data.get(current_text_channel_id):
-            target_text_channel_id, target_text_channel_name = current_text_channel_id, text_channels_data[current_text_channel_id]['name']
-        elif text_channels_data:
-            first_text_ch = next(iter(text_channels_data.values()), None)
-            if first_text_ch: target_text_channel_id, target_text_channel_name = first_text_ch['id'], first_text_ch['name']
-        
-        await _leave_current_voice_channel_if_any(page_ref, switch_to_text=True, new_text_channel_id=target_text_channel_id, new_text_channel_name=target_text_channel_name)
-        current_text_channel_id = target_text_channel_id # Ensure this is set after leaving voice
+        global current_text_channel_id # Keep for context but not forcing switch
+        global previewing_voice_channel_id, voice_channels_data # Need these to stay on the same voice channel (preview)
 
-    async def fetch_and_display_channels(p: ft.Page): # Simplified, no changes from previous full code
+        # We need to know which voice channel we are leaving to re-select it for preview.
+        channel_id_being_left = current_voice_channel_id # This is the channel we were actively in.
+        channel_name_being_left = "Unknown Voice Channel"
+        if channel_id_being_left and voice_channels_data.get(channel_id_being_left):
+            channel_name_being_left = voice_channels_data[channel_id_being_left]['name']
+
+        # Leave the voice channel, but don't switch the middle panel to a text channel.
+        # The _leave_current_voice_channel_if_any will reset is_actively_in_voice_channel to False
+        # and call update_voice_channel_user_list_ui -> update_voice_panel_button_visibility.
+        # This should revert the UI to the "preview" state for the channel we were just in.
+        await _leave_current_voice_channel_if_any(page_ref, switch_to_text=False)
+
+        # After leaving, we want to ensure the UI is showing the preview for the channel we just left.
+        # _leave_current_voice_channel_if_any sets previewing_voice_channel_id to None.
+        # We need to re-establish it to show the preview of the channel we just left.
+        if channel_id_being_left is not None:
+            previewing_voice_channel_id = channel_id_being_left # Set it back for preview
+            # current_text_channel_id = None # Ensure no text channel is considered active
+            # current_voice_channel_active_users.clear() # Already done in _leave_current_voice_channel_if_any
+            
+            # Switch view to voice panel (if not already) and update its content for the preview state.
+            switch_middle_panel_view("voice", channel_name_being_left) 
+            update_voice_channel_user_list_ui() # This will update based on the new previewing_voice_channel_id
+                                                # and is_actively_in_voice_channel (which is now False)
+                                                # It also calls update_voice_panel_button_visibility.
+        else:
+            # If for some reason we couldn't identify the channel, maybe fall back to a default text view.
+            # This case should ideally not happen if leave button was visible.
+            first_text_ch = next(iter(text_channels_data.values()), None)
+            if first_text_ch:
+                await select_text_channel(page_ref, first_text_ch['id'], first_text_ch['name'])
+            else:
+                switch_middle_panel_view("text", "No text channels available")
+
+        if hasattr(page_ref, 'update'): page_ref.update()
+
+    async def fetch_and_display_channels(p: ft.Page):
         global text_channels_data, voice_channels_data
         if not shared_aiohttp_session or shared_aiohttp_session.closed: return
         async with shared_aiohttp_session.get(f"{API_BASE_URL}/channels") as response:
@@ -294,12 +740,31 @@ async def main(page: ft.Page):
                 text_channels, voice_channels = data.get("text_channels", []), data.get("voice_channels", [])
                 text_channels_data = {tc['id']: tc for tc in text_channels}
                 voice_channels_data = {vc['id']: vc for vc in voice_channels}
-                channel_list_controls = [ft.Text("Text Channels", weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_GREY_300)]
-                for tc in text_channels: channel_list_controls.append(ft.TextButton(content=ft.Row([ft.Icon(ft.Icons.CHAT_BUBBLE_OUTLINE, size=16), ft.Text(tc['name'])]), on_click=lambda _, t_id=tc['id'], t_name=tc['name']: p.run_task(select_text_channel, p, t_id, t_name), style=ft.ButtonStyle(color=ft.Colors.BLACK)))
-                channel_list_controls.append(ft.Container(content=ft.Text("Voice Channels", weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_GREY_300), margin=ft.margin.only(top=10)))
-                for vc in voice_channels: channel_list_controls.append(ft.TextButton(content=ft.Row([ft.Icon(ft.Icons.VOICE_CHAT_OUTLINED, size=16), ft.Text(vc['name'])]), on_click=lambda _, v_id=vc['id'], v_name=vc['name']: p.run_task(select_voice_channel, p, v_id, v_name), style=ft.ButtonStyle(color=ft.Colors.BLACK)))
+                
+                channel_list_controls = [ft.Text("Text Channels", weight=ft.FontWeight.BOLD, color=COLOR_TEXT_DARK_PURPLE)]
+                for tc in text_channels: 
+                    channel_list_controls.append(ft.TextButton(
+                        content=ft.Row([ft.Icon(ft.Icons.CHAT_BUBBLE_OUTLINE, size=16, color=COLOR_TEXT_DARK_PURPLE), ft.Text(tc['name'])]),
+                        on_click=lambda _, t_id=tc['id'], t_name=tc['name']: p.run_task(select_text_channel, p, t_id, t_name), 
+                        style=ft.ButtonStyle(color=COLOR_TEXT_DARK_PURPLE)
+                    ))
+                
+                channel_list_controls.append(ft.Container(
+                    content=ft.Text("Voice Channels", weight=ft.FontWeight.BOLD, color=COLOR_TEXT_DARK_PURPLE), 
+                    margin=ft.margin.only(top=10))
+                )
+                for vc in voice_channels: 
+                    channel_list_controls.append(ft.TextButton(
+                        content=ft.Row([ft.Icon(ft.Icons.VOICE_CHAT_OUTLINED, size=16, color=COLOR_TEXT_DARK_PURPLE), ft.Text(vc['name'])]),
+                        on_click=lambda _, v_id=vc['id'], v_name=vc['name']: p.run_task(select_voice_channel, p, v_id, v_name), 
+                        style=ft.ButtonStyle(color=COLOR_TEXT_DARK_PURPLE)
+                    ))
                 if active_page_controls.get('channel_list_view'): active_page_controls['channel_list_view'].controls = channel_list_controls
-            else: print(f"Failed to fetch channels: {response.status}")
+            else: 
+                print(f"Failed to fetch channels: {response.status}")
+                if active_page_controls.get('channel_list_view'): 
+                    active_page_controls['channel_list_view'].controls = [ft.Text("Error loading channels.", color=COLOR_TEXT_DARK_PURPLE)]
+
             if hasattr(p, 'update'): p.update()
     
     async def attempt_login(e, is_auto_login=False): # Simplified, no changes from previous full code
@@ -339,51 +804,205 @@ async def main(page: ft.Page):
     async def show_register_view(e): # Simplified
         if active_page_controls.get('status_text'): active_page_controls['status_text'].value = "Reg not implemented."
 
-    username_field = ft.TextField(label="Username", width=300, autofocus=True, value=app_config.get("username", ""))
-    password_field = ft.TextField(label="Password", password=True, can_reveal_password=True, width=300, value=app_config.get("password", ""))
-    login_button = ft.ElevatedButton(text="Login", on_click=lambda e: page.run_task(attempt_login, e, False), width=150)
-    register_button = ft.ElevatedButton(text="Register", on_click=show_register_view, width=150)
-    active_page_controls['login'] = ft.Column([ft.Text("Client Login", size=24, weight=ft.FontWeight.BOLD), username_field, password_field, ft.Row([remember_me_checkbox], alignment=ft.MainAxisAlignment.CENTER), ft.Row([login_button, register_button], alignment=ft.MainAxisAlignment.CENTER), active_page_controls['status_text']], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=20)
+    username_field = ft.TextField(label="Username", width=300, autofocus=True, value=app_config.get("username", ""),
+                                  border_color=COLOR_BORDER, focused_border_color=COLOR_PRIMARY_PURPLE,
+                                  label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE),
+                                  text_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE))
+    password_field = ft.TextField(label="Password", password=True, can_reveal_password=True, width=300, value=app_config.get("password", ""),
+                                  border_color=COLOR_BORDER, focused_border_color=COLOR_PRIMARY_PURPLE,
+                                  label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE),
+                                  text_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE))
+    login_button = ft.ElevatedButton(text="Login", on_click=lambda e: page.run_task(attempt_login, e, False), width=150,
+                                     bgcolor=COLOR_PRIMARY_PURPLE, color=COLOR_BUTTON_TEXT)
+    register_button = ft.ElevatedButton(text="Register", on_click=show_register_view, width=150,
+                                        bgcolor=COLOR_PRIMARY_PURPLE, color=COLOR_BUTTON_TEXT)
+    active_page_controls['login'] = ft.Column([
+        ft.Text("Client Login", size=24, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_ON_WHITE), 
+            username_field,
+            password_field,
+        ft.Row([remember_me_checkbox], alignment=ft.MainAxisAlignment.CENTER), 
+            ft.Row([login_button, register_button], alignment=ft.MainAxisAlignment.CENTER),
+        active_page_controls['status_text']
+    ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=20, expand=True) # Added expand for better centering on page
 
     active_page_controls['channel_list_view'] = ft.ListView(expand=False, spacing=2, width=220, padding=10)
-    active_page_controls['current_chat_topic'] = ft.Text("Select a text channel", weight=ft.FontWeight.BOLD, size=16)
-    active_page_controls['chat_messages_view'] = ft.ListView(expand=True, spacing=5, auto_scroll=True, padding=10)
-    active_page_controls['message_input_field'] = ft.TextField(hint_text="Type...", expand=True, filled=True, border_radius=20, on_submit=lambda e: page.run_task(handle_send_message_click, page))
-    active_page_controls['send_message_button'] = ft.IconButton(icon=ft.Icons.SEND_ROUNDED, on_click=lambda e: page.run_task(handle_send_message_click, page))
-    active_page_controls['chat_panel_content_group'] = ft.Column([active_page_controls['current_chat_topic'], ft.Divider(height=1), active_page_controls['chat_messages_view'], ft.Row([active_page_controls['message_input_field'], active_page_controls['send_message_button']])], expand=True, visible=True)
-
-    active_page_controls['voice_channel_topic_display'] = ft.Text("Voice Channel", weight=ft.FontWeight.BOLD, size=16)
-    active_page_controls['voice_channel_internal_users_list'] = ft.ListView(expand=True, spacing=5, padding=10)
-    active_page_controls['voice_settings_area'] = ft.Column(
-        [ft.Text("语音设置 (待实现)", weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_GREY_400)],
-        visible=False,
-        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-        spacing=10
+    active_page_controls['current_chat_topic'] = ft.Text("Select a text channel", weight=ft.FontWeight.BOLD, size=16, color=COLOR_TEXT_ON_WHITE)
+    active_page_controls['chat_messages_view'] = ft.ListView(expand=True, spacing=5, auto_scroll=True, padding=10) # Text color within messages will be default black on white
+    active_page_controls['message_input_field'] = ft.TextField(
+        hint_text="Type...", expand=True, filled=True, border_radius=20, 
+        on_submit=lambda e: page.run_task(handle_send_message_click, page),
+        bgcolor=COLOR_INPUT_FIELD_BG_FILLED,
+        border_color=COLOR_BORDER,
+        focused_border_color=COLOR_PRIMARY_PURPLE,
+        text_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE)
     )
-    active_page_controls['confirm_join_voice_button'] = ft.ElevatedButton(text="加入语音", icon=ft.Icons.CALL, on_click=lambda e: page.run_task(handle_confirm_join_voice_button_click, page), visible=False, style=ft.ButtonStyle(bgcolor=ft.Colors.GREEN_ACCENT_700, color=ft.Colors.WHITE))
-    active_page_controls['leave_voice_button'] = ft.ElevatedButton(text="离开语音", icon=ft.Icons.CALL_END, on_click=lambda e: page.run_task(handle_leave_voice_click, page), visible=False, style=ft.ButtonStyle(bgcolor=ft.Colors.RED_ACCENT_700, color=ft.Colors.WHITE))
+    active_page_controls['send_message_button'] = ft.IconButton(
+        icon=ft.Icons.SEND_ROUNDED, 
+        on_click=lambda e: page.run_task(handle_send_message_click, page),
+        icon_color=COLOR_PRIMARY_PURPLE # Icon color for send button
+    )
+    active_page_controls['chat_panel_content_group'] = ft.Column([
+        active_page_controls['current_chat_topic'], 
+        ft.Divider(height=1, color=COLOR_DIVIDER_ON_WHITE), 
+        active_page_controls['chat_messages_view'], 
+        ft.Row([active_page_controls['message_input_field'], active_page_controls['send_message_button']])
+    ], expand=True, visible=True)
+
+    active_page_controls['voice_channel_topic_display'] = ft.Text("Voice Channel", weight=ft.FontWeight.BOLD, size=16, color=COLOR_TEXT_ON_WHITE)
+    active_page_controls['voice_channel_internal_users_list'] = ft.ListView(expand=True, spacing=5, padding=10) # Text color handled in update_voice_channel_user_list_ui
+    
+    # --- Voice Settings Area Definition ---
+    active_page_controls['voice_settings_input_device_dropdown'] = ft.Dropdown(
+        options=[ft.dropdown.Option(key="-1", text="Loading...")],
+        label="Input Device",
+        width=250,
+        text_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE, size=12),
+        label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE, size=12),
+        border_color=COLOR_BORDER,
+        focused_border_color=COLOR_PRIMARY_PURPLE,
+        on_change=handle_input_device_change
+    )
+    active_page_controls['voice_settings_output_device_dropdown'] = ft.Dropdown(
+        options=[ft.dropdown.Option(key="-1", text="Loading...")],
+        label="Output Device",
+        width=250,
+        text_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE, size=12),
+        label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE, size=12),
+        border_color=COLOR_BORDER,
+        focused_border_color=COLOR_PRIMARY_PURPLE,
+        on_change=handle_output_device_change
+    )
+    active_page_controls['voice_settings_input_volume_slider'] = ft.Slider(
+        min=0, max=100, divisions=100, value=100, 
+        label="{value}%",
+        active_color=COLOR_PRIMARY_PURPLE,
+        inactive_color=ft.Colors.with_opacity(0.3, COLOR_PRIMARY_PURPLE)
+    )
+    active_page_controls['voice_settings_mute_button'] = ft.IconButton(
+        icon=ft.Icons.MIC,
+        tooltip="Mute Microphone",
+        on_click=handle_mute_mic_click,
+        icon_color=COLOR_TEXT_ON_WHITE,
+        icon_size=18
+    )
+    active_page_controls['voice_settings_mic_test_bar'] = ft.ProgressBar(
+        width=180,
+        value=0, 
+        color=COLOR_PRIMARY_PURPLE, 
+        bgcolor=ft.Colors.with_opacity(0.2, COLOR_PRIMARY_PURPLE)
+    )
+    active_page_controls['voice_settings_mic_test_button'] = ft.ElevatedButton(
+        text="Start Mic Test",
+        icon=ft.Icons.PLAY_ARROW,
+        on_click=handle_mic_test_button_click,
+        style=ft.ButtonStyle(
+            bgcolor=COLOR_PRIMARY_PURPLE, 
+            color=COLOR_BUTTON_TEXT,
+            shape=ft.RoundedRectangleBorder(radius=5)
+        ),
+        height=36
+    )
+    active_page_controls['voice_settings_save_button'] = ft.ElevatedButton(
+        text="Save Audio Settings",
+        icon=ft.Icons.SAVE_OUTLINED,
+        on_click=handle_save_audio_settings_click, # No page.run_task needed for async handlers directly assigned
+        style=ft.ButtonStyle(bgcolor=COLOR_PRIMARY_PURPLE, color=COLOR_BUTTON_TEXT, shape=ft.RoundedRectangleBorder(radius=5)),
+        height=36,
+        tooltip="Save selected Input/Output devices"
+    )
+
+    active_page_controls['voice_settings_area'] = ft.Column(
+        [
+            ft.Text("Voice Settings", weight=ft.FontWeight.BOLD, size=14, color=COLOR_TEXT_ON_WHITE),
+            ft.Divider(height=5, color=COLOR_DIVIDER_ON_WHITE),
+            active_page_controls['voice_settings_input_device_dropdown'],
+            active_page_controls['voice_settings_output_device_dropdown'],
+            active_page_controls['voice_settings_input_volume_slider'], # Slider directly added
+            ft.Row( # Mic test row, centered
+                [
+                    active_page_controls['voice_settings_mic_test_button'],
+                    active_page_controls['voice_settings_mic_test_bar']
+                ],
+                alignment=ft.MainAxisAlignment.CENTER, # Centered this row's content
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=10
+            ),
+            active_page_controls['voice_settings_mute_button'], # Mute button directly added
+            ft.Row( # Save button centered in a new Row
+                [active_page_controls['voice_settings_save_button']],
+                alignment=ft.MainAxisAlignment.CENTER
+            )
+        ],
+        visible=False,
+        spacing=8, # Reduced spacing
+        width=280,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER # Added horizontal alignment for the column
+    )
+    active_page_controls['confirm_join_voice_button'] = ft.ElevatedButton(
+        text="加入语音", icon=ft.Icons.CALL, 
+        on_click=lambda e: page.run_task(handle_confirm_join_voice_button_click, page), 
+        visible=False, 
+        style=ft.ButtonStyle(bgcolor=COLOR_PRIMARY_PURPLE, color=COLOR_BUTTON_TEXT),
+        icon_color=COLOR_ICON_ON_PURPLE
+    )
+    active_page_controls['leave_voice_button'] = ft.ElevatedButton(
+        text="离开语音", icon=ft.Icons.CALL_END, 
+        on_click=lambda e: page.run_task(handle_leave_voice_click, page), 
+        visible=False, 
+        style=ft.ButtonStyle(bgcolor=COLOR_PRIMARY_PURPLE, color=COLOR_BUTTON_TEXT),
+        icon_color=COLOR_ICON_ON_PURPLE
+    )
     active_page_controls['voice_panel_content_group'] = ft.Column([
         active_page_controls['voice_channel_topic_display'], 
-        ft.Divider(height=1), 
-        ft.Container(content=ft.Text("Users in channel:", weight=ft.FontWeight.W_600), margin=ft.margin.only(top=10, bottom=5)),
+        ft.Divider(height=1, color=COLOR_DIVIDER_ON_WHITE), 
+        ft.Container(content=ft.Text("Users in channel:", weight=ft.FontWeight.W_600, color=COLOR_TEXT_ON_WHITE), margin=ft.margin.only(top=10, bottom=5)),
         active_page_controls['voice_channel_internal_users_list'],
-        active_page_controls['voice_settings_area'],
+        active_page_controls['voice_settings_area'], 
         active_page_controls['confirm_join_voice_button'],
         active_page_controls['leave_voice_button']
     ], expand=True, visible=False)
     
-    middle_panel_container = ft.Container(ft.Stack([active_page_controls['chat_panel_content_group'], active_page_controls['voice_panel_content_group']]), expand=True, padding=10, bgcolor=ft.Colors.WHITE)
-    left_panel = ft.Container(ft.Column([ft.Text("Channels",weight=ft.FontWeight.BOLD,size=18,color=ft.Colors.WHITE), ft.Divider(height=5,color=ft.Colors.BLUE_GREY_700),active_page_controls['channel_list_view']], expand=True), width=240,padding=0,bgcolor=ft.Colors.BLUE_GREY_800)
-    active_page_controls['current_voice_channel_text'] = ft.Text("Not in voice", weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE, size=12, italic=True)
+    middle_panel_container = ft.Container(
+        ft.Stack([active_page_controls['chat_panel_content_group'], active_page_controls['voice_panel_content_group']]), 
+        expand=True, padding=10, bgcolor=COLOR_BACKGROUND_WHITE,
+        border=ft.border.all(1, COLOR_BORDER)
+    )
+    left_panel = ft.Container(
+        ft.Column([
+            ft.Text("Channels",weight=ft.FontWeight.BOLD,size=18,color=COLOR_TEXT_DARK_PURPLE),
+            ft.Divider(height=5,color=COLOR_DIVIDER_ON_WHITE),
+            active_page_controls['channel_list_view']
+        ], expand=True), 
+        width=240,padding=0,bgcolor=COLOR_BACKGROUND_WHITE,
+        border=ft.border.all(1, COLOR_BORDER)
+    )
+    active_page_controls['current_voice_channel_text'] = ft.Text("Not in voice", weight=ft.FontWeight.BOLD, color=COLOR_TEXT_ON_PURPLE, size=12, italic=True)
     active_page_controls['server_users_list_view'] = ft.ListView(expand=True, spacing=3, padding=ft.padding.only(top=5))
-    right_panel = ft.Container(ft.Column([ft.Text("Server Users",weight=ft.FontWeight.BOLD,size=16,color=ft.Colors.BLUE_GREY_700),ft.Divider(height=1),active_page_controls['server_users_list_view']], expand=True,horizontal_alignment=ft.CrossAxisAlignment.CENTER), width=200,padding=10,bgcolor=ft.Colors.BLUE_GREY_50)
+    right_panel = ft.Container(
+        ft.Column([
+            ft.Text("Server Users",weight=ft.FontWeight.BOLD,size=16,color=COLOR_TEXT_ON_WHITE),
+            ft.Divider(height=1, color=COLOR_DIVIDER_ON_WHITE),
+            active_page_controls['server_users_list_view']
+        ], expand=True,horizontal_alignment=ft.CrossAxisAlignment.CENTER), 
+        width=200,padding=10,bgcolor=COLOR_BACKGROUND_WHITE,
+        border=ft.border.all(1, COLOR_BORDER)
+    )
     main_app_layout = ft.Row([left_panel, middle_panel_container, right_panel], expand=True, vertical_alignment=ft.CrossAxisAlignment.STRETCH)
     
-    active_page_controls['top_bar_username_text'] = ft.Text("User: N/A", size=16, weight=ft.FontWeight.BOLD, expand=True, color=ft.Colors.WHITE)
-    active_page_controls['main_status_bar'] = ft.Text(value="", size=12, color=ft.Colors.GREY)
+    active_page_controls['top_bar_username_text'] = ft.Text("User: N/A", size=16, weight=ft.FontWeight.BOLD, expand=True, color=COLOR_TEXT_ON_PURPLE)
+    active_page_controls['main_status_bar'] = ft.Text(value="", size=12, color=COLOR_STATUS_TEXT_MUTED)
     main_app_view_content = ft.Column([
-        ft.Container(ft.Row([active_page_controls['top_bar_username_text'], active_page_controls['current_voice_channel_text'], ft.IconButton(ft.Icons.LOGOUT, on_click=lambda e: show_login_view(page),tooltip="Logout",icon_color=ft.Colors.WHITE)],vertical_alignment=ft.CrossAxisAlignment.CENTER),bgcolor=ft.Colors.BLUE_700,padding=ft.padding.symmetric(horizontal=15,vertical=10)),
-        main_app_layout, active_page_controls['main_status_bar']
+        ft.Container(
+            ft.Row([
+                active_page_controls['top_bar_username_text'], 
+                active_page_controls['current_voice_channel_text'], 
+                ft.IconButton(ft.Icons.LOGOUT, on_click=lambda e: show_login_view(page),tooltip="Logout",icon_color=COLOR_ICON_ON_PURPLE)
+            ],vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            bgcolor=COLOR_PRIMARY_PURPLE,
+            padding=ft.padding.symmetric(horizontal=15,vertical=10)
+        ),
+        main_app_layout, 
+        active_page_controls['main_status_bar']
     ], expand=True, visible=False, spacing=0)
     active_page_controls['main_app'] = main_app_view_content
     
@@ -402,12 +1021,18 @@ async def main(page: ft.Page):
         if hasattr(p, 'update'): p.update()
 
     def show_main_app_view(p: ft.Page):
+        global page # Ensure page global is set for other functions that might need it like save
+        page = p # Assign the current page to the global `page` variable
         active_page_controls['login'].visible = False
         active_page_controls['main_app'].visible = True
         if current_user_info and active_page_controls.get('top_bar_username_text'): active_page_controls['top_bar_username_text'].value = f"User: {current_user_info.get('username', 'N/A')}"
-        update_voice_panel_button_visibility() # Ensure correct buttons on view show
+        update_voice_panel_button_visibility()
         if hasattr(p, 'update'): p.update()
         
+        if SOUNDDEVICE_AVAILABLE:
+            # Pass the page instance if needed by the task, or ensure 'page' global is accessible
+            p.run_task(populate_audio_device_dropdowns) 
+
     async def handle_send_message_click(page_ref: ft.Page):
         msg_content = active_page_controls['message_input_field'].value.strip()
         if msg_content and current_text_channel_id is not None and sio_client and sio_client.connected:

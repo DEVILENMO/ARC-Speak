@@ -245,34 +245,26 @@ def handle_connect():
 def handle_disconnect():
     if current_user.is_authenticated and current_user.id in connected_users:
         print(f"User {connected_users[current_user.id]['username']} (ID: {current_user.id}, SID: {request.sid}) disconnected.")
+        
         # 清理用户的语音会话
         session = VoiceSession.query.filter_by(user_id=current_user.id).first()
         if session:
-            # Inform others in the voice channel about leaving (if not already handled by a specific 'leave' event)
-            # emit('user_left_voice', {'user_id': current_user.id}, room=f"voice_channel_{session.channel_id}")
+            channel_id_being_left = session.channel_id
+            # Inform others in the voice channel about leaving
+            emit('user_left_voice', {
+                'channel_id': channel_id_being_left, 
+                'user_id': current_user.id,
+                'username': connected_users[current_user.id]['username'] # Include username for consistency
+            }, room=f"voice_channel_{channel_id_being_left}")
+            
             db.session.delete(session)
             db.session.commit()
-            print(f"Cleaned up voice session for user {current_user.id}")
+            print(f"Cleaned up voice session for user {current_user.id} from channel {channel_id_being_left}")
 
-        # 更新用户状态或从 connected_users 移除
-        # Option 1: Mark as offline (allows re-listing them if they reconnect quickly or showing offline users)
-        connected_users[current_user.id]['online'] = False
-        # connected_users[current_user.id]['sid'] = None # SID is no longer valid
-        
-        # Option 2: Remove from dictionary (simpler if we only care about currently online users)
-        # del connected_users[current_user.id] 
-        # For this implementation, let's stick to marking offline and then filtering on the client or during emit.
-        # However, for a cleaner server_user_list_update, let's filter out offline users before emitting.
-
-        active_online_users = {uid: uinfo for uid, uinfo in connected_users.items() if uinfo['online']}
-        # It might be better to just remove them if 'online' is the primary state we track for the list.
-        # Let's try removing them directly for simplicity of the broadcasted list.
         if current_user.id in connected_users:
              del connected_users[current_user.id]
 
-        # 向所有客户端广播更新的用户列表
         emit('server_user_list_update', list(connected_users.values()), broadcast=True)
-        # emit('user_disconnected', {'user_id': current_user.id}, broadcast=True) # This is now covered by server_user_list_update
     else:
         print(f"Disconnect event for an unauthenticated or unknown user. SID: {request.sid}")
 
@@ -323,75 +315,68 @@ def handle_message(data):
 # WebSocket: 加入语音频道
 @socketio.on('join_voice_channel')
 def handle_join_voice_channel(data):
-    channel_id = data.get('channel_id') # Ensure client sends this
+    channel_id = data.get('channel_id')
     if not channel_id:
         emit('error', {'message': 'Channel ID missing in join_voice_channel request'})
         return
 
     target_channel = Channel.query.get(channel_id)
-
     if not target_channel:
         emit('error', {'message': '语音频道不存在'})
         return
-    
     if target_channel.channel_type != 'voice':
         emit('error', {'message': '目标频道不是语音频道'})
         return
-
-    # 权限检查: 加入语音频道
     if target_channel.is_private and not current_user.is_admin and current_user not in target_channel.members:
         emit('error', {'message': '您没有权限加入此私有语音频道'})
         return
 
-    # 检查用户是否已在其他语音频道
     existing_session = VoiceSession.query.filter_by(user_id=current_user.id).first()
+    user_was_already_in_target_channel = False
+
     if existing_session:
-        if existing_session.channel_id != channel_id: # Only leave if it's a different channel
+        if existing_session.channel_id != channel_id:
             old_channel_id = existing_session.channel_id
             leave_room(f"voice_channel_{old_channel_id}")
             db.session.delete(existing_session)
-            # Notify users in the old channel that this user left
             emit('user_left_voice', {
-                'channel_id': old_channel_id, 
-                'user_id': current_user.id
+                'channel_id': old_channel_id,
+                'user_id': current_user.id,
+                'username': current_user.username 
             }, room=f"voice_channel_{old_channel_id}")
-        else: # Already in this channel, maybe a rejoin attempt or client UI refresh
-            pass # Or resend user list to this user? For now, assume client handles UI.
-    
-    # 创建新的语音会话 (or update if already exists for this channel due to above logic)
-    # To prevent duplicate sessions if user is already in the target channel and existing_session matched channel_id
-    current_session_in_target_channel = VoiceSession.query.filter_by(user_id=current_user.id, channel_id=channel_id).first()
-    if not current_session_in_target_channel:
-        new_session = VoiceSession(
-            user_id=current_user.id,
-            channel_id=channel_id
-        )
+            print(f"User {current_user.username} left old voice channel {old_channel_id} before joining {channel_id}")
+        else: # User is already in the target channel's session
+            user_was_already_in_target_channel = True
+            print(f"User {current_user.username} is re-joining/refreshing voice channel {channel_id}")
+
+    if not user_was_already_in_target_channel:
+        new_session = VoiceSession(user_id=current_user.id, channel_id=channel_id)
         db.session.add(new_session)
     
-    db.session.commit() # Commit changes (new session, or deletion of old one)
+    db.session.commit()
     
-    # 加入房间
     join_room(f"voice_channel_{channel_id}")
     
-    # 获取频道中的所有用户
-    users_in_channel = VoiceSession.query.filter_by(channel_id=channel_id).all()
-    user_list = [{'user_id': session.user.id, 'username': session.user.username} for session in users_in_channel if session.user]
+    users_in_channel_q = VoiceSession.query.filter_by(channel_id=channel_id).all()
+    user_list = [{'user_id': s.user.id, 'username': s.user.username, 'avatar_url': s.user.avatar_url} for s in users_in_channel_q if s.user]
     
-    # 通知发起请求的用户当前频道内的所有用户
     emit('voice_channel_users', {
-        'channel_id': channel_id, 
+        'channel_id': channel_id,
         'users': user_list
-    }, room=request.sid) # Emitting only to the requester
+    }, room=request.sid)
 
-    # 通知房间内其他用户有新人加入 (if they weren't already in this session)
-    if not existing_session or existing_session.channel_id != channel_id:
+    if not user_was_already_in_target_channel:
         emit('user_joined_voice', {
             'channel_id': channel_id,
-            'user_id': current_user.id, 
+            'user_id': current_user.id,
             'username': current_user.username,
-            'avatar_url': current_user.avatar_url # Good to send avatar here too
+            'avatar_url': current_user.avatar_url
         }, room=f"voice_channel_{channel_id}", skip_sid=request.sid)
-    print(f"User {current_user.username} processed join for voice channel {channel_id}. SID: {request.sid}")
+        print(f"User {current_user.username} newly joined voice channel {channel_id}. SID: {request.sid}")
+    else:
+        # Optionally, if user was already in channel, we might want to inform them their "rejoin" was processed
+        # For now, sending voice_channel_users is the primary feedback.
+        print(f"User {current_user.username} re-confirmed in voice channel {channel_id}. SID: {request.sid}")
 
 # WebSocket: 离开语音频道
 @socketio.on('leave_voice_channel')
