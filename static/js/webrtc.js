@@ -13,20 +13,24 @@ let webrtcCurrentUserId = null; // 用于存储当前用户ID
 let currentChannelIdForWebRTC = null;
 const DEBUG_LOOPBACK = false; // <--- 添加这个开关，设为 true 来启用本地回环
 
+console.log("webrtc.js loaded"); // 确认文件加载
+
 // 初始化WebRTC模块，传入socket实例和当前用户ID
 function initializeWebRTC(socketInstance, currentUserId) {
     webrtcSocket = socketInstance;
     webrtcCurrentUserId = currentUserId;
+    console.debug("[WebRTC] Initializing WebRTC with Socket and User ID:", webrtcCurrentUserId);
 
     // 将所有依赖 socket 的事件监听器移到这里
     webrtcSocket.on('voice_signal', handleVoiceSignal);
     webrtcSocket.on('user_speaking', handleUserSpeaking);
     webrtcSocket.on('user_mute_status', handleUserMuteStatus);
-    console.log("WebRTC signaling initialized with socket and user ID.");
+    console.debug("[WebRTC] Event listeners for voice_signal, user_speaking, user_mute_status attached.");
 }
 
 // 初始化媒体流
 async function initializeMedia() {
+    console.debug("[WebRTC] Attempting to initialize media...");
     try {
         const preferredMicrophone = localStorage.getItem('selectedAudioInput'); // <--- 确保这里用的是 selectedAudioInput
         const constraints = {
@@ -34,38 +38,34 @@ async function initializeMedia() {
                 { deviceId: { exact: preferredMicrophone } } : 
                 true
         };
+        console.debug("[WebRTC] getUserMedia constraints:", constraints);
         
         localStream = await navigator.mediaDevices.getUserMedia(constraints);
-        console.log('麦克风已初始化', localStream);
+        console.log('[WebRTC] Microphone initialized (localStream):', localStream);
+
+        if (localStream && localStream.getAudioTracks().length > 0) {
+            console.debug("[WebRTC] Local stream has audio tracks:", localStream.getAudioTracks());
+        } else {
+            console.warn("[WebRTC] Local stream acquired but has NO audio tracks.");
+        }
 
         if (DEBUG_LOOPBACK && localStream) {
-            const loopbackAudio = document.createElement('audio');
-            loopbackAudio.autoplay = true;
-            loopbackAudio.muted = true; // 开始时静音，防止啸叫，用户可以通过浏览器控制播放
-            loopbackAudio.srcObject = localStream;
-            // 可以考虑将这个元素添加到DOM中并隐藏，或者不添加，直接播放
-            // document.getElementById('remote-audio-container').appendChild(loopbackAudio); 
-            // console.log("本地回环已启用。确保解除静音以听到自己声音。");
-            // 实际上，为了直接听到，我们可以不设置 muted = true，但要小心可能的啸叫
-            // 如果直接播放，则需要确保输出设备和输入设备不同，或者用户戴耳机
-            // 更安全的方式是创建一个新的AudioContext来处理回环并控制音量
-
-            // 安全的回环方式，避免直接播放可能导致的啸叫
+            console.debug("[WebRTC] DEBUG_LOOPBACK enabled. Creating local audio loopback.");
             const audioContext = new (window.AudioContext || window.webkitAudioContext)();
             const source = audioContext.createMediaStreamSource(localStream);
             const gainNode = audioContext.createGain();
             gainNode.gain.value = 0.7; // 设置一个适中的回环音量，避免过大
             source.connect(gainNode);
             gainNode.connect(audioContext.destination); // 连接到默认输出
-            console.log("本地调试回环已启用，音量 0.7");
+            console.debug("[WebRTC] Local debug loopback enabled, volume 0.7");
         }
 
         // 在成功获取localStream后，设置音量检测
         // (由 main.html 中的 joinVoiceChannel 调用此函数后，再调用 setupVolumeDetection)
 
     } catch (error) {
-        console.error('无法访问麦克风:', error);
-        alert('无法访问麦克风。请检查浏览器权限设置。');
+        console.error('[WebRTC] Error initializing media (getUserMedia):', error);
+        alert('无法访问麦克风。请检查浏览器权限设置和控制台错误。错误: ' + error.message);
     }
 }
 
@@ -105,66 +105,110 @@ function toggleMute() {
 
 // 创建对等连接
 function createPeerConnection(userId) {
-    if (peerConnections[userId]) return peerConnections[userId];
+    console.debug(`[WebRTC] Creating PeerConnection for user: ${userId}`);
+    if (peerConnections[userId]) {
+        console.debug(`[WebRTC] PeerConnection for user ${userId} already exists.`);
+        return peerConnections[userId];
+    }
     
-    // 兼容性检查
     const RTCPeerConnection = window.RTCPeerConnection || window.mozRTCPeerConnection || window.webkitRTCPeerConnection;
     if (!RTCPeerConnection) {
-        console.error("WebRTC PeerConnection is not supported by this browser.");
+        console.error("[WebRTC] FATAL: RTCPeerConnection is not supported by this browser.");
         alert("WebRTC PeerConnection is not supported by this browser.");
         return null;
     }
+    console.debug("[WebRTC] RTCPeerConnection constructor available.");
 
     const pc = new RTCPeerConnection(configuration);
     peerConnections[userId] = pc;
+    console.debug(`[WebRTC] PeerConnection created for user ${userId}. Configuration:`, JSON.parse(JSON.stringify(configuration))); // Deep copy for logging
     
     if (localStream) {
-        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+        console.debug(`[WebRTC] Adding localStream tracks to PeerConnection for user ${userId}.`);
+        localStream.getTracks().forEach(track => {
+            try {
+                pc.addTrack(track, localStream);
+                console.debug(`[WebRTC] Added track ${track.kind} (id: ${track.id}) to PC for ${userId}`);
+            } catch (e) {
+                console.error(`[WebRTC] Error adding track ${track.id} to PC for ${userId}:`, e);
+            }
+        });
+    } else {
+        console.warn(`[WebRTC] localStream is not available when creating PeerConnection for ${userId}. Remote user might not receive audio.`);
     }
     
     pc.onicecandidate = event => {
-        if (event.candidate && webrtcSocket) {
-            webrtcSocket.emit('voice_signal', {
-                type: 'ice_candidate',
-                candidate: event.candidate,
-                recipient_id: userId
-            });
+        if (event.candidate) {
+            console.debug(`[WebRTC] ICE candidate generated for user ${userId}:`, event.candidate);
+            if (webrtcSocket) {
+                webrtcSocket.emit('voice_signal', {
+                    type: 'ice_candidate',
+                    candidate: event.candidate,
+                    recipient_id: userId
+                });
+                console.debug(`[WebRTC] Sent ICE candidate to user ${userId}.`);
+            } else {
+                console.warn("[WebRTC] onicecandidate: webrtcSocket not available to send ICE candidate.");
+            }
+        } else {
+            console.debug(`[WebRTC] All ICE candidates have been sent for user ${userId}.`);
         }
     };
     
     pc.onconnectionstatechange = event => {
-        console.log(`连接状态 (${userId}):`, pc.connectionState);
-        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected' || pc.connectionState === 'closed') {
-            // 可以考虑在这里清理 peerConnections[userId]
+        console.log(`[WebRTC] PeerConnection state change for user ${userId}: ${pc.connectionState}`);
+        if (pc.connectionState === 'failed') {
+            console.error(`[WebRTC] PeerConnection for user ${userId} failed. Check ICE server configuration and network.`);
         }
+        // Further handling for states like 'disconnected', 'closed' can be added here.
+    };
+
+    pc.onnegotiationneeded = event => {
+        console.debug(`[WebRTC] Negotiation needed for user ${userId}. Event:`, event);
+        // This event can sometimes be used to trigger renegotiation if needed, 
+        // but often offer/answer is handled ينايرally.
     };
     
     pc.ontrack = event => {
-        console.log('收到远程流 for user:', userId, event);
+        console.log(`[WebRTC] Received remote track from user ${userId}:`, event.track, 'Stream(s):', event.streams);
         const remoteAudioContainer = document.getElementById('remote-audio-container');
         if (!remoteAudioContainer) {
-            console.error("Remote audio container not found!");
+            console.error("[WebRTC] ontrack: Remote audio container (remote-audio-container) not found!");
             return;
         }
 
         let remoteAudio = document.getElementById(`audio-${userId}`);
         if (!remoteAudio) {
+            console.debug(`[WebRTC] Creating <audio> element for remote user ${userId}`);
             remoteAudio = document.createElement('audio');
             remoteAudio.id = `audio-${userId}`;
-            remoteAudio.autoplay = true;
+            remoteAudio.autoplay = true; // Autoplay is crucial
             
             const preferredSpeaker = localStorage.getItem('selectedAudioOutput'); // 从 settings.html 读取选择
             if (preferredSpeaker && preferredSpeaker !== 'default' && typeof remoteAudio.setSinkId === 'function') {
+                console.debug(`[WebRTC] Attempting to set SinkId to ${preferredSpeaker} for user ${userId}`);
                 remoteAudio.setSinkId(preferredSpeaker)
-                    .then(() => console.log(`Audio output set to ${preferredSpeaker} for user ${userId}`))
-                    .catch(error => console.error('扬声器设置失败:', error));
+                    .then(() => console.log(`[WebRTC] Audio output successfully set to ${preferredSpeaker} for user ${userId}`))
+                    .catch(error => console.error(`[WebRTC] Error setting SinkId for user ${userId}:`, error));
+            } else {
+                console.debug(`[WebRTC] Using default audio output for user ${userId}.`);
             }
             remoteAudioContainer.appendChild(remoteAudio);
+            console.debug(`[WebRTC] Appended <audio id='audio-${userId}'> to remote-audio-container.`);
         }
         
         if (remoteAudio.srcObject !== event.streams[0]) {
+            console.log(`[WebRTC] Attaching remote stream from user ${userId} to <audio> element.`);
             remoteAudio.srcObject = event.streams[0];
-            remoteAudio.play().catch(e => console.error("Error playing remote audio:", e));
+            remoteAudio.play().then(() => {
+                console.log(`[WebRTC] Remote audio for user ${userId} is playing.`);
+            }).catch(e => {
+                console.error(`[WebRTC] Error attempting to play remote audio for user ${userId}:`, e, 
+                              "This might be due to browser autoplay policies. User interaction might be needed.");
+                // alert(`Could not automatically play audio from user ${userId}. Please interact with the page (e.g., click) and try again.`);
+            });
+        } else {
+            console.debug(`[WebRTC] Remote stream for user ${userId} already attached to <audio> element.`);
         }
     };
     
@@ -173,52 +217,93 @@ function createPeerConnection(userId) {
 
 // 协商连接
 async function negotiateConnection(userId) {
-    if (!webrtcSocket) return;
+    console.debug(`[WebRTC] Initiating negotiation with user: ${userId}`);
+    if (!webrtcSocket) {
+        console.error("[WebRTC] negotiateConnection: webrtcSocket not available.");
+        return;
+    }
     try {
         const pc = createPeerConnection(userId);
-        if (!pc) return;
+        if (!pc) {
+            console.error(`[WebRTC] negotiateConnection: Failed to create PeerConnection for user ${userId}.`);
+            return;
+        }
         
+        console.debug(`[WebRTC] Creating offer for user ${userId}...`);
         const offer = await pc.createOffer();
+        console.debug(`[WebRTC] Offer created for user ${userId}:`, offer);
+        
         await pc.setLocalDescription(offer);
+        console.debug(`[WebRTC] Local description set for user ${userId}. SDP:`, pc.localDescription);
         
         webrtcSocket.emit('voice_signal', {
             type: 'offer',
             sdp: pc.localDescription,
             recipient_id: userId
         });
+        console.log(`[WebRTC] Sent offer to user ${userId}.`);
     } catch (error) {
-        console.error(`连接协商失败 (${userId}):`, error);
+        console.error(`[WebRTC] Error during negotiation (offer) with user ${userId}:`, error);
     }
 }
 
 // 处理信令 (作为回调函数)
 async function handleVoiceSignal(data) {
-    if (!webrtcSocket || !data.sender_id) return;
-    try {
-        const pc = createPeerConnection(data.sender_id); // 确保对端连接已创建或获取
-        if (!pc) return;
+    console.debug("[WebRTC] Received voice_signal:", data);
+    if (!webrtcSocket || !data.sender_id) {
+        console.error("[WebRTC] handleVoiceSignal: webrtcSocket or sender_id missing in data.", data);
+        return;
+    }
+    
+    const senderId = data.sender_id;
+    console.debug(`[WebRTC] Processing voice_signal from user ${senderId}, type: ${data.type}`);
+    
+    const pc = createPeerConnection(senderId); 
+    if (!pc) {
+        console.error(`[WebRTC] handleVoiceSignal: Failed to create/get PeerConnection for sender ${senderId}.`);
+        return;
+    }
 
+    try {
         if (data.type === 'offer') {
+            console.debug(`[WebRTC] Received offer from ${senderId}. SDP:`, data.sdp);
             await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+            console.debug(`[WebRTC] Remote description (offer) set for ${senderId}.`);
+            
+            console.debug(`[WebRTC] Creating answer for ${senderId}...`);
             const answer = await pc.createAnswer();
+            console.debug(`[WebRTC] Answer created for ${senderId}:`, answer);
+            
             await pc.setLocalDescription(answer);
+            console.debug(`[WebRTC] Local description (answer) set for ${senderId}. SDP:`, pc.localDescription);
+            
             webrtcSocket.emit('voice_signal', {
                 type: 'answer',
                 sdp: pc.localDescription,
-                recipient_id: data.sender_id
+                recipient_id: senderId
             });
+            console.log(`[WebRTC] Sent answer to ${senderId}.`);
+
         } else if (data.type === 'answer') {
+            console.debug(`[WebRTC] Received answer from ${senderId}. SDP:`, data.sdp);
             await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+            console.debug(`[WebRTC] Remote description (answer) set for ${senderId}.`);
+
         } else if (data.type === 'ice_candidate' && data.candidate) {
+            console.debug(`[WebRTC] Received ICE candidate from ${senderId}:`, data.candidate);
             try {
                 await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                console.debug(`[WebRTC] Added ICE candidate from ${senderId}.`);
             } catch (e) {
-                console.warn('Failed to add ICE candidate immediately, possibly still connecting:', e.message);
-                // 不再使用setTimeout缓存，依赖onconnectionstatechange或其他机制
+                console.warn(`[WebRTC] Failed to add ICE candidate from ${senderId}: ${e.message}. PC state: ${pc.signalingState}`);
+                // Ice candidates might arrive before the remote description is set, especially if it's an offer.
+                // Browsers typically queue them, but explicit queuing might be needed in some race conditions.
             }
+        } else {
+            console.warn("[WebRTC] Received unknown or incomplete voice_signal type:", data);
         }
     } catch (error) {
-        console.error(`处理信令错误 (from ${data.sender_id}, type ${data.type}):`, error);
+        console.error(`[WebRTC] Error processing voice_signal from ${senderId} (type ${data.type}):`, error);
     }
 }
 
