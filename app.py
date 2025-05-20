@@ -1,12 +1,10 @@
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from models import db, User, Channel, Message, VoiceSession
-from forms import LoginForm, RegisterForm, ChannelForm, SettingsForm
 import os
 from datetime import datetime
-from flask_sslify import SSLify
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24)
@@ -16,13 +14,16 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # 初始化扩展
 db.init_app(app)
 socketio = SocketIO(app)
-sslify = SSLify(app)
 login_manager = LoginManager(app)
-login_manager.login_view = 'login'
 
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
+
+@login_manager.unauthorized_handler
+def unauthorized():
+    # Return a 401 Unauthorized response for API clients
+    return jsonify(success=False, message="Authentication required"), 401
 
 # 创建初始数据 (移除 @app.before_first_request)
 def create_initial_data():
@@ -38,159 +39,184 @@ def create_initial_data():
     else:
         print("Default channels already exist.")
 
-# 路由: 主页
-@app.route('/')
-def index():
-    if current_user.is_authenticated:
-        return redirect(url_for('main'))
-    return redirect(url_for('login'))
-
-# 路由: 登录
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    form = LoginForm()
-    if form.validate_on_submit():
-        user = User.query.filter_by(username=form.username.data).first()
-        if user and check_password_hash(user.password, form.password.data):
-            login_user(user)
-            return redirect(url_for('main'))
-        flash('用户名或密码错误')
-    return render_template('login.html', form=form)
-
-# 路由: 注册
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    form = RegisterForm()
-    if form.validate_on_submit():
-        if form.invite_code.data != 'ARC2015':
-            flash('邀请码错误')
-            return render_template('register.html', form=form)
-            
-        # 检查用户名是否存在
-        if User.query.filter_by(username=form.username.data).first():
-            flash('用户名已存在')
-            return render_template('register.html', form=form)
-            
-        # 创建新用户
-        hashed_password = generate_password_hash(form.password.data)
-        new_user = User(username=form.username.data, password=hashed_password)
-        db.session.add(new_user)
-        db.session.commit()
-        flash('注册成功，请登录')
-        return redirect(url_for('login'))
-    return render_template('register.html', form=form)
-
-# 路由: 主界面
-@app.route('/main')
-@login_required
-def main():
-    # 获取用户有权访问的频道
-    text_channels_query = Channel.query.filter_by(channel_type='text')
-    voice_channels_query = Channel.query.filter_by(channel_type='voice')
-
-    if not current_user.is_admin:
-        # 普通用户只能看到公共频道或他们是成员的私有频道
-        text_channels = [ch for ch in text_channels_query.all() if not ch.is_private or current_user in ch.members]
-        voice_channels = [ch for ch in voice_channels_query.all() if not ch.is_private or current_user in ch.members]
-    else:
-        # 管理员可以看到所有频道
-        text_channels = text_channels_query.all()
-        voice_channels = voice_channels_query.all()
-
-    return render_template('main.html', 
-                          text_channels=text_channels, 
-                          voice_channels=voice_channels)
-
-# 路由: 频道
-@app.route('/channel/<int:channel_id>')
-@login_required
-def channel(channel_id):
-    channel_obj = Channel.query.get_or_404(channel_id) # Renamed to avoid conflict
-
-    # 权限检查
-    if channel_obj.is_private and not current_user.is_admin and current_user not in channel_obj.members:
-        flash('您没有权限访问此私有频道。', 'error')
-        return redirect(url_for('main'))
-
-    # 获取用户有权访问的频道列表 (用于侧边栏)
-    text_channels_query = Channel.query.filter_by(channel_type='text')
-    voice_channels_query = Channel.query.filter_by(channel_type='voice')
-    if not current_user.is_admin:
-        text_channels = [ch for ch in text_channels_query.all() if not ch.is_private or current_user in ch.members]
-        voice_channels = [ch for ch in voice_channels_query.all() if not ch.is_private or current_user in ch.members]
-    else:
-        text_channels = text_channels_query.all()
-        voice_channels = voice_channels_query.all()
+# 路由: 登录 API
+@app.route('/api/login', methods=['POST'])
+def login_api():
+    data = request.get_json()
+    if not data or not data.get('username') or not data.get('password'):
+        return jsonify(success=False, message="Username and password required"), 400
     
-    if channel_obj.channel_type == 'text':
-        messages = Message.query.filter_by(channel_id=channel_id).order_by(Message.timestamp).all()
-        return render_template('main.html', 
-                              current_channel=channel_obj,
-                              messages=messages,
-                              text_channels=text_channels, 
-                              voice_channels=voice_channels)
-    else:  # 语音频道
-        active_users = VoiceSession.query.filter_by(channel_id=channel_id).all()
-        return render_template('main.html', 
-                              current_channel=channel_obj,
-                              active_users=active_users,
-                              text_channels=text_channels, 
-                              voice_channels=voice_channels)
-
-# 路由: 设置
-@app.route('/settings', methods=['GET', 'POST'])
-@login_required
-def settings():
-    form = SettingsForm(obj=current_user)
-
-    if form.validate_on_submit():
-        current_user.avatar_url = form.avatar_url.data
-        current_user.auto_join_voice = form.auto_join_voice.data
-        db.session.commit()
-        flash('设置已成功保存', 'success')
-        return redirect(url_for('settings'))
-
-    return render_template('settings.html', form=form)
-
-# 路由: 管理员创建频道
-@app.route('/create_channel', methods=['GET', 'POST'])
-@login_required
-def create_channel():
-    if not current_user.is_admin:
-        flash('只有管理员可以创建频道')
-        return redirect(url_for('main'))
-        
-    form = ChannelForm()
-    if form.validate_on_submit():
-        new_channel = Channel(
-            name=form.name.data,
-            channel_type=form.channel_type.data,
-            is_private=form.is_private.data
+    user = User.query.filter_by(username=data.get('username')).first()
+    if user and check_password_hash(user.password, data.get('password')):
+        login_user(user)
+        # TODO: Consider session management/token for desktop app if needed beyond SocketIO auth
+        return jsonify(
+            success=True, 
+            user={'id': user.id, 'username': user.username, 'avatar_url': user.avatar_url, 'is_admin': user.is_admin}
         )
-        db.session.add(new_channel)
-        
-        if new_channel.is_private:
-            new_channel.members.append(current_user)
-            
-        db.session.commit()
-        flash('频道创建成功', 'success')
-        return redirect(url_for('main'))
-    return render_template('create_channel.html', form=form)
+    return jsonify(success=False, message='用户名或密码错误'), 401
 
-# 路由: 登出
-@app.route('/logout')
+# 路由: 注册 API
+@app.route('/api/register', methods=['POST'])
+def register_api():
+    data = request.get_json()
+    if not data:
+        return jsonify(success=False, message="Request body cannot be empty"), 400
+
+    username = data.get('username')
+    password = data.get('password')
+    invite_code = data.get('invite_code')
+
+    if not username or not password:
+        return jsonify(success=False, message="Username and password required"), 400
+    
+    # For simplicity, invite code check can be basic for now
+    if invite_code != 'ARC2015': 
+        return jsonify(success=False, message='邀请码错误'), 400
+            
+    if User.query.filter_by(username=username).first():
+        return jsonify(success=False, message='用户名已存在'), 409 # 409 Conflict
+            
+    hashed_password = generate_password_hash(password)
+    new_user = User(username=username, password=hashed_password)
+    db.session.add(new_user)
+    db.session.commit()
+    return jsonify(success=True, message='注册成功，请登录'), 201
+
+# 路由: 登出 API
+@app.route('/api/logout', methods=['POST'])
 @login_required
-def logout():
+def logout_api():
     logout_user()
-    return redirect(url_for('login'))
+    return jsonify(success=True, message='登出成功')
+
+# Endpoint to get current user info
+@app.route('/api/users/me', methods=['GET'])
+@login_required
+def get_current_user_api():
+    return jsonify(
+        id=current_user.id,
+        username=current_user.username,
+        avatar_url=current_user.avatar_url,
+        is_admin=current_user.is_admin,
+        auto_join_voice=current_user.auto_join_voice # Assuming this field exists on User model
+    )
+
+# Endpoint to get channels
+@app.route('/api/channels', methods=['GET'])
+@login_required
+def get_channels_api():
+    text_channels_query = Channel.query.filter_by(channel_type='text')
+    voice_channels_query = Channel.query.filter_by(channel_type='voice')
+
+    if not current_user.is_admin:
+        text_channels_list = [ch for ch in text_channels_query.all() if not ch.is_private or current_user in ch.members]
+        voice_channels_list = [ch for ch in voice_channels_query.all() if not ch.is_private or current_user in ch.members]
+    else:
+        text_channels_list = text_channels_query.all()
+        voice_channels_list = voice_channels_query.all()
+    
+    return jsonify(
+        text_channels=[{'id': ch.id, 'name': ch.name, 'is_private': ch.is_private} for ch in text_channels_list],
+        voice_channels=[{'id': ch.id, 'name': ch.name, 'is_private': ch.is_private} for ch in voice_channels_list]
+    )
+
+# API: Update user settings
+@app.route('/api/settings', methods=['POST'])
+@login_required
+def update_settings_api():
+    data = request.get_json()
+    if not data:
+        return jsonify(success=False, message="Request body cannot be empty"), 400
+
+    # Basic validation
+    if 'avatar_url' in data:
+        current_user.avatar_url = data.get('avatar_url')
+    if 'auto_join_voice' in data and isinstance(data.get('auto_join_voice'), bool):
+        current_user.auto_join_voice = data.get('auto_join_voice')
+    
+    # Add more specific validation as needed
+    # Example: check if avatar_url is a valid URL format
+
+    try:
+        db.session.commit()
+        return jsonify(
+            success=True, 
+            message='设置已成功保存', 
+            user={
+                'id': current_user.id,
+                'username': current_user.username,
+                'avatar_url': current_user.avatar_url, 
+                'is_admin': current_user.is_admin,
+                'auto_join_voice': current_user.auto_join_voice
+            }
+        )
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(success=False, message=f"更新设置失败: {str(e)}"), 500
+
+# API: Create a new channel (Admin only)
+@app.route('/api/channels', methods=['POST']) # Changed from /api/admin/channels for consistency with GET /api/channels
+@login_required
+def create_channel_api():
+    if not current_user.is_admin:
+        return jsonify(success=False, message='只有管理员可以创建频道'), 403
+
+    data = request.get_json()
+    if not data:
+        return jsonify(success=False, message="Request body cannot be empty"), 400
+
+    name = data.get('name')
+    channel_type = data.get('channel_type')
+    is_private = data.get('is_private', False) # Default to public if not provided
+
+    if not name or not channel_type:
+        return jsonify(success=False, message="频道名称和类型是必需的"), 400
+    
+    if channel_type not in ['text', 'voice']:
+        return jsonify(success=False, message="无效的频道类型"), 400
+    
+    if not isinstance(is_private, bool):
+        return jsonify(success=False, message="is_private 必须是布尔值"), 400
+
+    new_channel = Channel(
+        name=name,
+        channel_type=channel_type,
+        is_private=is_private
+    )
+    db.session.add(new_channel)
+    
+    # If private, admin creator is automatically a member
+    if new_channel.is_private:
+        if current_user not in new_channel.members: # Should always be true for a new channel
+             new_channel.members.append(current_user)
+            
+    try:
+        db.session.commit()
+        return jsonify(
+            success=True, 
+            message='频道创建成功', 
+            channel={
+                'id': new_channel.id, 
+                'name': new_channel.name, 
+                'channel_type': new_channel.channel_type,
+                'is_private': new_channel.is_private
+            }
+        ), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(success=False, message=f"创建频道失败: {str(e)}"), 500
 
 # WebSocket: 连接事件
 @socketio.on('connect')
 def handle_connect():
     if current_user.is_authenticated:
+        join_room(f"user_{current_user.id}") # User joins their own room
+        print(f"User {current_user.username} (ID: {current_user.id}, SID: {request.sid}) connected and joined room user_{current_user.id}")
         emit('user_connected', {'user_id': current_user.id, 'username': current_user.username}, broadcast=True)
     else:
-        return False
+        print(f"Unauthenticated connection attempt from SID: {request.sid}")
+        return False # Disconnect unauthenticated users
 
 # WebSocket: 断开连接事件
 @socketio.on('disconnect')
@@ -330,124 +356,138 @@ def handle_voice_signal(data):
         # Emit to a user-specific room for WebRTC signaling
         emit('voice_signal', data, room=f"user_{recipient_id}")
 
-# 错误处理
-@app.errorhandler(404)
-def page_not_found(e):
-    return render_template('404.html'), 404
-
-@app.errorhandler(500)
-def internal_server_error(e):
-    # 也可以在这里添加数据库回滚操作，以防错误是由数据库会话问题引起的
-    # db.session.rollback()
-    return render_template('500.html'), 500
-
-# 路由: 管理员面板
-@app.route('/admin')
+# API: Get all users (Admin only)
+@app.route('/api/admin/users', methods=['GET'])
 @login_required
-def admin_panel():
+def get_all_users_api():
     if not current_user.is_admin:
-        flash('只有管理员可以访问此页面', 'error')
-        return redirect(url_for('main'))
+        return jsonify(success=False, message='仅限管理员访问'), 403
     
     users = User.query.all()
-    channels = Channel.query.all()
-    return render_template('admin_panel.html', users=users, channels=channels)
+    return jsonify(success=True, users=[{'id': u.id, 'username': u.username, 'is_admin': u.is_admin, 'avatar_url': u.avatar_url} for u in users])
 
-# 路由: 切换用户管理员状态
-@app.route('/admin/user/<int:user_id>/toggle_admin')
+# API: Toggle admin status for a user (Admin only)
+@app.route('/api/admin/users/<int:user_id>/toggle_admin', methods=['POST'])
 @login_required
-def toggle_admin_status(user_id):
+def toggle_admin_status_api(user_id):
     if not current_user.is_admin:
-        flash('只有管理员可以执行此操作', 'error')
-        return redirect(url_for('main'))
+        return jsonify(success=False, message='仅限管理员访问'), 403
 
-    user_to_modify = User.query.get_or_404(user_id)
+    user_to_modify = User.query.get(user_id)
+    if not user_to_modify:
+        return jsonify(success=False, message='用户未找到'), 404
 
     if user_to_modify.id == current_user.id:
-        flash('不能修改自己的管理员状态', 'error')
-        return redirect(url_for('admin_panel'))
+        return jsonify(success=False, message='不能修改自己的管理员状态'), 400
 
     user_to_modify.is_admin = not user_to_modify.is_admin
-    db.session.commit()
-    
-    action = "授予" if user_to_modify.is_admin else "移除"
-    flash(f'用户 {user_to_modify.username} 的管理员权限已{action}', 'success')
-    return redirect(url_for('admin_panel'))
+    try:
+        db.session.commit()
+        action = "授予" if user_to_modify.is_admin else "移除"
+        return jsonify(success=True, message=f'用户 {user_to_modify.username} 的管理员权限已{action}', user={'id': user_to_modify.id, 'is_admin': user_to_modify.is_admin})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(success=False, message=f"操作失败: {str(e)}"), 500
 
-# 路由: 删除用户
-@app.route('/admin/user/<int:user_id>/delete')
+# API: Delete a user (Admin only)
+@app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
 @login_required
-def delete_user(user_id):
+def delete_user_api(user_id):
     if not current_user.is_admin:
-        flash('只有管理员可以执行此操作', 'error')
-        return redirect(url_for('main'))
+        return jsonify(success=False, message='仅限管理员访问'), 403
 
-    user_to_delete = User.query.get_or_404(user_id)
+    user_to_delete = User.query.get(user_id)
+    if not user_to_delete:
+        return jsonify(success=False, message='用户未找到'), 404
 
     if user_to_delete.id == current_user.id:
-        flash('不能删除自己', 'error')
-        return redirect(url_for('admin_panel'))
+        return jsonify(success=False, message='不能删除自己'), 400
 
-    # 删除与用户相关的消息和语音会话
-    Message.query.filter_by(user_id=user_to_delete.id).delete()
-    VoiceSession.query.filter_by(user_id=user_to_delete.id).delete()
-    
-    db.session.delete(user_to_delete)
-    db.session.commit()
-    
-    flash(f'用户 {user_to_delete.username} 已被成功删除', 'success')
-    return redirect(url_for('admin_panel'))
+    try:
+        # Consider cascading deletes in DB or more robust cleanup
+        Message.query.filter_by(user_id=user_to_delete.id).delete()
+        VoiceSession.query.filter_by(user_id=user_to_delete.id).delete()
+        # Remove user from channel memberships
+        for channel in Channel.query.filter(Channel.members.contains(user_to_delete)).all():
+            channel.members.remove(user_to_delete)
 
-# 路由: 编辑频道
-@app.route('/admin/channel/<int:channel_id>/edit', methods=['GET', 'POST'])
-@login_required
-def edit_channel(channel_id):
-    if not current_user.is_admin:
-        flash('只有管理员可以执行此操作', 'error')
-        return redirect(url_for('main'))
-
-    channel_to_edit = Channel.query.get_or_404(channel_id)
-    form = ChannelForm(obj=channel_to_edit) # 使用obj参数预填充表单
-
-    if form.validate_on_submit():
-        channel_to_edit.name = form.name.data
-        channel_to_edit.channel_type = form.channel_type.data
-        channel_to_edit.is_private = form.is_private.data
-
-        # 权限逻辑：如果频道从公开变为私有，确保创建者是成员
-        # 如果频道从私有变公开，可以考虑清除所有成员，或保留他们（当前选择保留）
-        if channel_to_edit.is_private:
-            if current_user not in channel_to_edit.members:
-                channel_to_edit.members.append(current_user)
-        # else:
-            # 如果从私有变为公开，是否清除成员？
-            # channel_to_edit.members = [] # 取消注释以在变为公开时清除成员
-
+        db.session.delete(user_to_delete)
         db.session.commit()
-        flash(f'频道 {channel_to_edit.name} 已成功更新', 'success')
-        return redirect(url_for('admin_panel'))
+        return jsonify(success=True, message=f'用户 {user_to_delete.username} 已被成功删除')
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(success=False, message=f"删除用户失败: {str(e)}"), 500
 
-    return render_template('edit_channel.html', form=form, channel=channel_to_edit)
-
-# 路由: 删除频道
-@app.route('/admin/channel/<int:channel_id>/delete')
+# API: Edit a channel (Admin only)
+@app.route('/api/admin/channels/<int:channel_id>', methods=['PUT']) # Using PUT for update
 @login_required
-def delete_channel(channel_id):
+def edit_channel_api(channel_id):
     if not current_user.is_admin:
-        flash('只有管理员可以执行此操作', 'error')
-        return redirect(url_for('main'))
+        return jsonify(success=False, message='仅限管理员访问'), 403
 
-    channel_to_delete = Channel.query.get_or_404(channel_id)
+    channel_to_edit = Channel.query.get(channel_id)
+    if not channel_to_edit:
+        return jsonify(success=False, message='频道未找到'), 404
 
-    # 删除与频道相关的消息和语音会话
-    Message.query.filter_by(channel_id=channel_to_delete.id).delete()
-    VoiceSession.query.filter_by(channel_id=channel_to_delete.id).delete()
-    
-    db.session.delete(channel_to_delete)
-    db.session.commit()
-    
-    flash(f'频道 {channel_to_delete.name} 已被成功删除', 'success')
-    return redirect(url_for('admin_panel'))
+    data = request.get_json()
+    if not data:
+        return jsonify(success=False, message="Request body cannot be empty"), 400
+
+    # Basic validation
+    if 'name' in data and data.get('name').strip():
+        channel_to_edit.name = data.get('name').strip()
+    if 'channel_type' in data and data.get('channel_type') in ['text', 'voice']:
+        channel_to_edit.channel_type = data.get('channel_type')
+    if 'is_private' in data and isinstance(data.get('is_private'), bool):
+        is_now_private = data.get('is_private')
+        # Logic if channel privacy changes
+        if is_now_private and not channel_to_edit.is_private: # Public to Private
+            if current_user not in channel_to_edit.members:
+                 channel_to_edit.members.append(current_user)
+        elif not is_now_private and channel_to_edit.is_private: # Private to Public
+            pass # Optional: channel_to_edit.members = [] # Clear members if desired
+        channel_to_edit.is_private = is_now_private
+        
+    try:
+        db.session.commit()
+        return jsonify(
+            success=True, 
+            message=f'频道 {channel_to_edit.name} 已成功更新',
+            channel={
+                'id': channel_to_edit.id, 
+                'name': channel_to_edit.name, 
+                'channel_type': channel_to_edit.channel_type,
+                'is_private': channel_to_edit.is_private
+            }
+        )
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(success=False, message=f"更新频道失败: {str(e)}"), 500
+
+# API: Delete a channel (Admin only)
+@app.route('/api/admin/channels/<int:channel_id>', methods=['DELETE'])
+@login_required
+def delete_channel_api(channel_id):
+    if not current_user.is_admin:
+        return jsonify(success=False, message='仅限管理员访问'), 403
+
+    channel_to_delete = Channel.query.get(channel_id)
+    if not channel_to_delete:
+        return jsonify(success=False, message='频道未找到'), 404
+
+    try:
+        # Consider cascading deletes in DB or more robust cleanup
+        Message.query.filter_by(channel_id=channel_to_delete.id).delete()
+        VoiceSession.query.filter_by(channel_id=channel_to_delete.id).delete()
+        # Clear members from the channel
+        channel_to_delete.members = []
+
+        db.session.delete(channel_to_delete)
+        db.session.commit()
+        return jsonify(success=True, message=f'频道 {channel_to_delete.name} 已被成功删除')
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(success=False, message=f"删除频道失败: {str(e)}"), 500
 
 if __name__ == '__main__':
     with app.app_context():
