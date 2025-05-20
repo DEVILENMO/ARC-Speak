@@ -242,28 +242,64 @@
 
     // 全局的 inVoiceChannel 状态
     let inVoiceChannel = false;
+    let localStreamReady = false; // <--- 新增标志位
+    let pendingPeerConnectionUserIds = []; // <--- 存储等待处理的用户ID
             
+    function processPendingPeerConnections() {
+        if (localStreamReady && pendingPeerConnectionUserIds.length > 0) {
+            console.debug("[MainHTML] Processing pending peer connections for users:", pendingPeerConnectionUserIds);
+            pendingPeerConnectionUserIds.forEach(userId => {
+                if (userId != currentUserId && typeof createPeerConnection === 'function' && typeof negotiateConnection === 'function') {
+                    console.debug("[MainHTML] Creating peer connection for pending user:", userId);
+                    createPeerConnection(userId); 
+                    negotiateConnection(userId);
+                }
+            });
+            pendingPeerConnectionUserIds = []; // 清空队列
+        }
+    }
+
     function joinVoiceChannel(channelId) {
         if (!socket || !currentUserId) {
-            console.error("Socket or User ID not available for joining voice channel.");
+            console.error("[MainHTML] Socket or User ID not available for joining voice channel.");
             return;
         }
+        console.log(`[MainHTML] Attempting to join voice channel ${channelId}`);
         socket.emit('join_voice_channel', {channel_id: channelId});
-        currentChannelId = channelId; // 更新当前频道ID
+        currentChannelId = channelId; 
 
         document.getElementById('join-voice-btn').style.display = 'none';
         document.getElementById('leave-voice-btn').style.display = 'inline';
         document.getElementById('mute-btn').style.display = 'inline';
         
+        localStreamReady = false; // 重置状态
+        inVoiceChannel = false;   // 确保在媒体绪后再设置为true
+
         if (typeof initializeMedia === 'function') {
+            console.debug("[MainHTML] Calling initializeMedia()...");
             initializeMedia().then(() => {
-                // 确保 localStream 初始化完成后再设置音量检测
+                console.log("[MainHTML] initializeMedia() successful (localStream should be ready in webrtc.js).");
+                localStreamReady = true; // <--- 在 localStream 真正就绪后设置
+                inVoiceChannel = true;   // <--- 此时才算真正进入频道
+
                 if (typeof setupVolumeDetection === 'function' && currentChannelId) {
-                    setupVolumeDetection(currentChannelId); // <--- 调用 webrtc.js 中的音量检测并传入 channelId
+                    console.debug("[MainHTML] Calling setupVolumeDetection()...");
+                    setupVolumeDetection(currentChannelId); 
                 }
+                // 初始化媒体成功后，处理任何待处理的连接
+                processPendingPeerConnections(); 
+            }).catch(error => {
+                console.error("[MainHTML] initializeMedia() failed:", error);
+                // 处理错误，例如重置UI
+                document.getElementById('join-voice-btn').style.display = 'inline';
+                document.getElementById('leave-voice-btn').style.display = 'none';
+                document.getElementById('mute-btn').style.display = 'none';
+                localStreamReady = false;
+                inVoiceChannel = false;
             });
+        } else {
+            console.error("[MainHTML] initializeMedia function is not defined in webrtc.js");
         }
-        inVoiceChannel = true;
     }
             
     function leaveVoiceChannel() {
@@ -288,6 +324,7 @@
         const remoteAudioContainer = document.getElementById('remote-audio-container');
         if (remoteAudioContainer) remoteAudioContainer.innerHTML = '';
         
+        localStreamReady = false; // <--- 重置状态
         inVoiceChannel = false;
         // 移除当前用户卡片的 speaking 状态 (如果需要)
         const currentUserCard = document.getElementById('voice-user-' + currentUserId);
@@ -305,8 +342,8 @@
                 }
             });
         {% else %} // 语音频道脚本
-            // 用户加入语音频道事件 (保持不变，使用 webrtc.js 中的 createPeerConnection)
             socket.on('user_joined_voice', function(data) {
+                console.debug("[MainHTML] Event: user_joined_voice", data);
                 const usersContainer = document.getElementById('users-container');
                 if (!document.getElementById('voice-user-' + data.user_id)) {
                     const userCard = document.createElement('div');
@@ -328,29 +365,32 @@
                     userCard.appendChild(micStatusDiv);
                     if(usersContainer) usersContainer.appendChild(userCard);
                 }
-                if (inVoiceChannel && data.user_id != currentUserId && typeof createPeerConnection === 'function' && typeof negotiateConnection === 'function') {
-                    createPeerConnection(data.user_id); // from webrtc.js
-                    negotiateConnection(data.user_id);  // from webrtc.js
+
+                if (data.user_id == currentUserId) return; // 不处理自己
+
+                if (inVoiceChannel && localStreamReady) { // <--- 检查 localStream 是否就绪
+                    console.debug("[MainHTML] localStream is ready, directly creating peer connection for new user:", data.user_id);
+                    if (typeof createPeerConnection === 'function' && typeof negotiateConnection === 'function') {
+                        createPeerConnection(data.user_id); 
+                        negotiateConnection(data.user_id);
+                    }
+                } else if (inVoiceChannel) { // 在频道中，但媒体流还未就绪
+                    console.debug("[MainHTML] localStream NOT YET ready. Adding user to pending list:", data.user_id);
+                    if (!pendingPeerConnectionUserIds.includes(data.user_id)) {
+                        pendingPeerConnectionUserIds.push(data.user_id);
+                    }
+                } else {
+                    console.debug("[MainHTML] Not in voice channel or localStream not ready, ignoring user_joined_voice for peer connection setup for user", data.user_id);
                 }
             });
             
-            // 用户离开语音频道事件 (保持不变)
-            socket.on('user_left_voice', function(data) {
-                const userElement = document.getElementById('voice-user-' + data.user_id);
-                if (userElement) userElement.remove();
-                if (peerConnections[data.user_id]) { // peerConnections from webrtc.js
-                    peerConnections[data.user_id].close();
-                    delete peerConnections[data.user_id];
-                }
-                const audioElement = document.getElementById('audio-' + data.user_id);
-                if (audioElement) audioElement.remove();
-            });
-            
-            // 接收语音频道当前用户列表 (保持不变，使用 webrtc.js 中的 createPeerConnection)
             socket.on('voice_channel_users', function(data) {
+                console.debug("[MainHTML] Event: voice_channel_users", data);
                 const usersContainer = document.getElementById('users-container');
                 if(usersContainer) usersContainer.innerHTML = '';
                 const currentUserIdString = String(currentUserId);
+                
+                let usersToConnect = [];
                 data.users.forEach(user => {
                     const userCard = document.createElement('div');
                     userCard.className = 'voice-user-card';
@@ -370,10 +410,30 @@
                     userCard.appendChild(usernameSpan);
                     userCard.appendChild(micStatusDiv);
                     if(usersContainer) usersContainer.appendChild(userCard);
-                    if (inVoiceChannel && String(user.user_id) != currentUserIdString && typeof createPeerConnection === 'function') {
-                        createPeerConnection(user.user_id); // from webrtc.js
+
+                    if (String(user.user_id) !== currentUserIdString) {
+                        usersToConnect.push(user.user_id);
                     }
                 });
+
+                if (inVoiceChannel && localStreamReady) { // <--- 检查 localStream 是否就绪
+                    console.debug("[MainHTML] localStream is ready, directly creating peer connections for existing users:", usersToConnect);
+                    usersToConnect.forEach(userId => {
+                        if (typeof createPeerConnection === 'function' && typeof negotiateConnection === 'function') {
+                             createPeerConnection(userId); 
+                             // negotiateConnection(userId); // 接收方通常不主动发起协商，而是等待 offer
+                        }
+                    });
+                } else if (inVoiceChannel) { // 在频道中，但媒体流还未就绪
+                    console.debug("[MainHTML] localStream NOT YET ready. Adding existing users to pending list:", usersToConnect);
+                    usersToConnect.forEach(userId => {
+                        if (!pendingPeerConnectionUserIds.includes(userId)) {
+                            pendingPeerConnectionUserIds.push(userId);
+                        }
+                    });
+                } else {
+                     console.debug("[MainHTML] Not in voice channel or localStream not ready, ignoring voice_channel_users for peer connection setup");
+                }
             });
 
             // 移除之前 main.html 中的 socket.on('other_user_speaking_status', ...)
