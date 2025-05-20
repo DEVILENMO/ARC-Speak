@@ -16,6 +16,9 @@ db.init_app(app)
 socketio = SocketIO(app)
 login_manager = LoginManager(app)
 
+# 全局存储连接的用户状态 (user_id: {username, sid, online, avatar_url, is_admin})
+connected_users = {}
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
@@ -211,9 +214,28 @@ def create_channel_api():
 @socketio.on('connect')
 def handle_connect():
     if current_user.is_authenticated:
-        join_room(f"user_{current_user.id}") # User joins their own room
+        join_room(f"user_{current_user.id}") # User joins their own room for direct messages/signals
         print(f"User {current_user.username} (ID: {current_user.id}, SID: {request.sid}) connected and joined room user_{current_user.id}")
-        emit('user_connected', {'user_id': current_user.id, 'username': current_user.username}, broadcast=True)
+        
+        # 更新或添加用户到 connected_users
+        connected_users[current_user.id] = {
+            'username': current_user.username,
+            'sid': request.sid,
+            'online': True,
+            'avatar_url': current_user.avatar_url, # Store avatar for rich presence
+            'is_admin': current_user.is_admin # Store admin status if needed for display
+        }
+        
+        # 向所有客户端广播更新的用户列表
+        emit('server_user_list_update', list(connected_users.values()), broadcast=True)
+        
+        # 也单独给当前连接的用户发送一次完整的列表 (以防万一广播稍早于其准备好接收)
+        # emit('server_user_list_update', list(connected_users.values()), room=request.sid)
+        # The broadcast=True should cover the new user as well, if they are ready to receive.
+        # A more robust way is to send it specifically to the new user after they signal readiness or here.
+        # For now, relying on the broadcast.
+
+        # emit('user_connected', {'user_id': current_user.id, 'username': current_user.username}, broadcast=True) # This is now covered by server_user_list_update
     else:
         print(f"Unauthenticated connection attempt from SID: {request.sid}")
         return False # Disconnect unauthenticated users
@@ -221,13 +243,38 @@ def handle_connect():
 # WebSocket: 断开连接事件
 @socketio.on('disconnect')
 def handle_disconnect():
-    if current_user.is_authenticated:
+    if current_user.is_authenticated and current_user.id in connected_users:
+        print(f"User {connected_users[current_user.id]['username']} (ID: {current_user.id}, SID: {request.sid}) disconnected.")
         # 清理用户的语音会话
         session = VoiceSession.query.filter_by(user_id=current_user.id).first()
         if session:
+            # Inform others in the voice channel about leaving (if not already handled by a specific 'leave' event)
+            # emit('user_left_voice', {'user_id': current_user.id}, room=f"voice_channel_{session.channel_id}")
             db.session.delete(session)
             db.session.commit()
-        emit('user_disconnected', {'user_id': current_user.id}, broadcast=True)
+            print(f"Cleaned up voice session for user {current_user.id}")
+
+        # 更新用户状态或从 connected_users 移除
+        # Option 1: Mark as offline (allows re-listing them if they reconnect quickly or showing offline users)
+        connected_users[current_user.id]['online'] = False
+        # connected_users[current_user.id]['sid'] = None # SID is no longer valid
+        
+        # Option 2: Remove from dictionary (simpler if we only care about currently online users)
+        # del connected_users[current_user.id] 
+        # For this implementation, let's stick to marking offline and then filtering on the client or during emit.
+        # However, for a cleaner server_user_list_update, let's filter out offline users before emitting.
+
+        active_online_users = {uid: uinfo for uid, uinfo in connected_users.items() if uinfo['online']}
+        # It might be better to just remove them if 'online' is the primary state we track for the list.
+        # Let's try removing them directly for simplicity of the broadcasted list.
+        if current_user.id in connected_users:
+             del connected_users[current_user.id]
+
+        # 向所有客户端广播更新的用户列表
+        emit('server_user_list_update', list(connected_users.values()), broadcast=True)
+        # emit('user_disconnected', {'user_id': current_user.id}, broadcast=True) # This is now covered by server_user_list_update
+    else:
+        print(f"Disconnect event for an unauthenticated or unknown user. SID: {request.sid}")
 
 # WebSocket: 加入文字频道
 @socketio.on('join_text_channel')
@@ -264,6 +311,7 @@ def handle_message(data):
     
     # 广播消息
     emit('new_message', {
+        'channel_id': channel_id,
         'message_id': new_message.id,
         'content': content,
         'username': current_user.username,
