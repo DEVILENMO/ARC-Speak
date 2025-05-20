@@ -1,33 +1,19 @@
 import flet as ft
 import aiohttp # For making HTTP requests
 import socketio # For SocketIO communication
+import ssl
 
 # --- Configuration ---
 SERVER_ADDRESS = "47.103.156.181"
 SERVER_PORT = 5005
 API_BASE_URL = f"https://{SERVER_ADDRESS}:{SERVER_PORT}/api"
-SIO_URL = f"https://{SERVER_ADDRESS}:{SERVER_PORT}" # python-socketio uses http/https for connect
+SIO_URL = f"https://{SERVER_ADDRESS}:{SERVER_PORT}"
 
 # --- Global State (Illustrative - will be refined) ---
-sio_client = socketio.AsyncClient(logger=True, engineio_logger=True)
+# sio_client will be initialized in main, after aiohttp_session is created
+sio_client = None 
 current_user_info = None
-active_page_controls = {} # To manage controls on different 'pages'
-
-# --- SocketIO Event Handlers (will be defined later) ---
-@sio_client.event
-async def connect():
-    print("Socket.IO connected successfully!")
-    # We might need to send an auth token or re-verify session here if not handled by cookies
-
-@sio_client.event
-async def disconnect():
-    print("Socket.IO disconnected.")
-
-@sio_client.event
-async def connect_error(data):
-    print(f"Socket.IO connection failed: {data}")
-
-# Add more handlers as needed: new_message, user_joined_voice, voice_signal etc.
+active_page_controls = {} 
 
 # --- Main Application Logic ---
 async def main(page: ft.Page):
@@ -35,7 +21,47 @@ async def main(page: ft.Page):
     page.vertical_alignment = ft.MainAxisAlignment.CENTER
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
 
-    status_text = ft.Text() # To display login status or errors
+    # Create a shared aiohttp session with custom SSL context for the entire app lifecycle
+    # WARNING: Disabling SSL verification is insecure for production.
+    custom_ssl_context = ssl.create_default_context()
+    custom_ssl_context.check_hostname = False
+    custom_ssl_context.verify_mode = ssl.CERT_NONE
+    connector = aiohttp.TCPConnector(ssl=custom_ssl_context)
+    
+    # Explicitly create and use a cookie_jar for the shared session
+    cookie_jar = aiohttp.CookieJar(unsafe=True) # unsafe=True can sometimes help with cross-domain or complex setups, use with caution.
+                                             # For same-domain, False (default) should be fine.
+    shared_aiohttp_session = aiohttp.ClientSession(connector=connector, cookie_jar=cookie_jar)
+
+    # Initialize SocketIO client with the shared aiohttp session
+    global sio_client
+    sio_client = socketio.AsyncClient(http_session=shared_aiohttp_session, logger=True, engineio_logger=True)
+
+    # --- SocketIO Event Handlers (now defined inside main where sio_client is valid) ---
+    @sio_client.event
+    async def connect():
+        print("Socket.IO connected successfully!")
+        # Potentially update UI or state
+        if 'status_text' in active_page_controls:
+             active_page_controls['status_text'].value = "Socket.IO Connected!"
+             page.update() # Make sure to update the page if a control is changed from an event
+
+    @sio_client.event
+    async def disconnect():
+        print("Socket.IO disconnected.")
+        if 'status_text' in active_page_controls:
+             active_page_controls['status_text'].value = "Socket.IO Disconnected."
+             page.update()
+
+    @sio_client.event
+    async def connect_error(data):
+        print(f"Socket.IO connection failed: {data}")
+        if 'status_text' in active_page_controls:
+             active_page_controls['status_text'].value = f"Socket.IO Error: {data}"
+             page.update()
+
+    status_text = ft.Text() 
+    active_page_controls['status_text'] = status_text # Store for access from SIO events
 
     async def attempt_login(e):
         username = username_field.value
@@ -47,48 +73,34 @@ async def main(page: ft.Page):
 
         login_payload = {"username": username, "password": password}
         
-        # Create a new SSL context that doesn't verify the certificate
-        # WARNING: This is insecure and should ONLY be used for development/testing
-        # with self-signed certificates. For production, use a proper CA-signed cert.
-        # ssl_context = ssl.create_default_context()
-        # ssl_context.check_hostname = False
-        # ssl_context.verify_mode = ssl.CERT_NONE
-        # connector = aiohttp.TCPConnector(ssl=ssl_context)
-
-        # For now, let's try without custom SSL context for aiohttp, 
-        # assuming the server's cert is valid or aiohttp handles it.
-        # If you get SSL errors, we might need to revisit the connector above.
-        
         try:
-            async with aiohttp.ClientSession() as session: # Removed connector for now
-                async with session.post(f"{API_BASE_URL}/login", json=login_payload) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get("success"):
-                            global current_user_info
-                            current_user_info = data.get("user")
-                            status_text.value = f"Login successful! Welcome, {current_user_info.get('username')}."
-                            print(f"Logged in user: {current_user_info}")
-                            
-                            # Attempt to connect to Socket.IO
-                            try:
-                                await sio_client.connect(SIO_URL, wait_timeout=10)
-                                # If connection successful, navigate to main app view
-                                show_main_app_view(page) 
-                            except socketio.exceptions.ConnectionError as sio_err:
-                                status_text.value = f"Login OK, but Socket.IO connection failed: {sio_err}"
-                                print(f"Socket.IO Connection Error: {sio_err}")
-                        else:
-                            status_text.value = f"Login failed: {data.get('message', 'Unknown error')}"
+            # Use the shared_aiohttp_session
+            async with shared_aiohttp_session.post(f"{API_BASE_URL}/login", json=login_payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("success"):
+                        global current_user_info
+                        current_user_info = data.get("user")
+                        status_text.value = f"Login successful! Welcome, {current_user_info.get('username')}."
+                        print(f"Logged in user: {current_user_info}")
+                        
+                        try:
+                            if not sio_client.connected:
+                                await sio_client.connect(SIO_URL, wait_timeout=10) # No SSL args needed here
+                            else:
+                                print("Socket.IO already connected.") # Or re-auth if needed
+                            show_main_app_view(page) 
+                        except socketio.exceptions.ConnectionError as sio_err:
+                            status_text.value = f"Login OK, but Socket.IO connection failed: {sio_err}"
+                            print(f"Socket.IO Connection Error: {sio_err}")
                     else:
-                        error_text = await response.text()
-                        status_text.value = f"Login request failed: {response.status} - {error_text}"
-        except aiohttp.ClientConnectorSSLError as ssl_error:
-            status_text.value = f"SSL Error: {ssl_error}. Ensure server SSL is correctly configured and accessible."
-            print(f"SSL Error during login: {ssl_error}")
-        except aiohttp.ClientError as http_err:
-            status_text.value = f"HTTP Error: {http_err}. Check server and network."
-            print(f"HTTP Error during login: {http_err}")
+                        status_text.value = f"Login failed: {data.get('message', 'Unknown error')}"
+                else:
+                    error_text = await response.text()
+                    status_text.value = f"Login request failed: {response.status} - {error_text}"
+        except aiohttp.ClientError as http_err: # General aiohttp client error
+            status_text.value = f"HTTP Connection Error: {http_err}. Check server and network."
+            print(f"HTTP Connection Error during login: {http_err}")
         except Exception as ex:
             status_text.value = f"An unexpected error occurred: {ex}"
             print(f"Unexpected error during login: {ex}")
@@ -98,11 +110,9 @@ async def main(page: ft.Page):
             page.update()
 
     async def show_register_view(e):
-        # For now, just a placeholder, will implement actual registration UI later
         status_text.value = "Registration UI not yet implemented."
         page.update()
 
-    # --- Login View Controls ---
     username_field = ft.TextField(label="Username", width=300, autofocus=True)
     password_field = ft.TextField(label="Password", password=True, can_reveal_password=True, width=300)
     login_button = ft.ElevatedButton(text="Login", on_click=attempt_login, width=150)
@@ -120,46 +130,47 @@ async def main(page: ft.Page):
         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
         spacing=20
     )
-    
     active_page_controls['login'] = login_view_controls
 
-    # --- Main App View (Placeholder) ---
     main_app_view_content = ft.Column(
         [
             ft.Text("Welcome to the App!", size=24),
-            # More controls will go here: channel list, user list, chat area, etc.
-            ft.ElevatedButton("Logout", on_click=lambda e: show_login_view(page)) # Logout re-shows login
+            ft.ElevatedButton("Logout", on_click=lambda e: show_login_view(page)) 
         ],
         alignment=ft.MainAxisAlignment.CENTER,
         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-        visible=False # Initially hidden
+        visible=False 
     )
     active_page_controls['main_app'] = main_app_view_content
     
-    # --- View Navigation Logic ---
     def show_login_view(p: ft.Page):
         active_page_controls['main_app'].visible = False
         active_page_controls['login'].visible = True
-        # Ensure SocketIO is disconnected if we are showing login view after a logout
-        if sio_client.connected:
-            # Create a task to disconnect to avoid blocking UI update
-            # p.run_task(sio_client.disconnect) # Flet's way to run async tasks
-            # For now, let's assume disconnect is handled elsewhere or not critical on simple logout
-            pass
+        # Consider what to do with shared_aiohttp_session and sio_client on logout
+        # For now, sio_client.disconnect() might be called if connected.
+        if sio_client and sio_client.connected:
+            p.run_task(sio_client.disconnect) # Disconnect in background
         p.update()
 
     def show_main_app_view(p: ft.Page):
         active_page_controls['login'].visible = False
         active_page_controls['main_app'].visible = True
-        # Update main view with user-specific info if needed
-        # For example: main_app_view_content.controls[0].value = f"Welcome, {current_user_info.get('username')}"
         p.update()
         
-    # --- Initial Page Setup ---
     page.add(login_view_controls, main_app_view_content)
-    show_login_view(page) # Start with the login view
+    show_login_view(page) 
 
-# Run the Flet app
-# To run this: save as flet_client.py and then in terminal: flet run flet_client.py
+    # Graceful shutdown for the aiohttp session when the Flet app closes
+    # This is a bit of a workaround as Flet's direct async cleanup hooks are not simple.
+    original_on_close = page.on_close if hasattr(page, 'on_close') else None
+    async def on_close_extended(e):
+        if original_on_close:
+            original_on_close(e) # Call original if it existed
+        if shared_aiohttp_session and not shared_aiohttp_session.closed:
+            print("Closing shared aiohttp session...")
+            await shared_aiohttp_session.close()
+            print("Shared aiohttp session closed.")
+    page.on_close = on_close_extended
+
 if __name__ == "__main__":
     ft.app(target=main) 
