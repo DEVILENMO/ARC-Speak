@@ -416,16 +416,17 @@ def handle_leave_voice_channel(data): # Expecting data to contain channel_id fro
 @socketio.on('user_speaking_status')
 def handle_user_speaking_status(data):
     channel_id = data.get('channel_id') # Client sends this
-    speaking = data.get('speaking')
+    is_unmuted = data.get('speaking') # True if client is not logically muted, False if muted
     user_id = current_user.id
 
-    if channel_id is not None and speaking is not None and user_id is not None:
+    if channel_id is not None and is_unmuted is not None and user_id is not None:
         room_name = f"voice_channel_{channel_id}"
-        print(f"[SPEAKING_STATUS] User {user_id} speaking: {speaking} in channel {channel_id} (room: {room_name})") # DEBUG
-        emit('user_speaking',
-             {'channel_id': channel_id, 'user_id': user_id, 'speaking': speaking}, 
+        # This print log now clarifies it's about the client's reported unmuted/muteable status
+        print(f"[MUTE_STATUS_RELAY] User {user_id} reported unmuted_status: {is_unmuted} in channel {channel_id} (room: {room_name})") 
+        emit('user_speaking', # This event will be used by clients for the mic icon
+             {'channel_id': channel_id, 'user_id': user_id, 'speaking': is_unmuted}, 
              room=room_name, 
-             skip_sid=request.sid) # skip_sid 确保事件不会发回给原始发送者
+             skip_sid=request.sid)
 
 # WebSocket: 接收并转发语音数据流
 @socketio.on('voice_data_stream')
@@ -436,7 +437,7 @@ def handle_voice_data_stream(data):
         return
 
     channel_id = data.get('channel_id')
-    audio_data = data.get('audio_data') # 客户端发送的原始PCM数据列表
+    audio_data = data.get('audio_data') 
     user_id = current_user.id
     username = current_user.username
 
@@ -445,21 +446,26 @@ def handle_voice_data_stream(data):
         emit('error', {'message': 'Voice data stream missing channel_id or audio_data.'}, room=request.sid)
         return
 
-    # 检查用户是否确实在目标语音频道 (可选, 但推荐)
     session = VoiceSession.query.filter_by(user_id=user_id, channel_id=channel_id).first()
     if not session:
         print(f"[VOICE_DATA_STREAM] User {user_id} ({username}) attempting to send voice data to channel {channel_id} they are not in (or session missing).")
-        # emit('error', {'message': 'You are not in this voice channel.'}, room=request.sid) # Potentially noisy
         return 
 
     room_name = f"voice_channel_{channel_id}"
-    print(f"[VOICE_DATA_STREAM] User {user_id} ({username}) sent voice data to channel {channel_id} (room: {room_name}). Data length: {len(audio_data) if isinstance(audio_data, list) else 'N/A'}") # DEBUG
+    print(f"[VOICE_DATA_STREAM] User {user_id} ({username}) sent voice data to channel {channel_id} (room: {room_name}). Data length: {len(audio_data) if isinstance(audio_data, list) else 'N/A'}")
     
-    # 将音频数据和发送者信息广播给房间内的其他用户
+    # NEW: Emit event to indicate this user is actively sending audio (for card color)
+    emit('user_voice_activity', {
+        'channel_id': channel_id,
+        'user_id': user_id,
+        'active': True # User is sending audio now
+    }, room=room_name, skip_sid=request.sid) # Other clients need this, sender already knows
+
+    # Forward the actual audio data for playback
     emit('voice_data_stream_chunk', {
         'channel_id': channel_id,
         'user_id': user_id,
-        'username': username, # 发送用户名可能对客户端有帮助
+        'username': username, 
         'audio_data': audio_data
     }, room=room_name, skip_sid=request.sid)
 

@@ -64,6 +64,9 @@ is_sending_audio = False
 audio_stream_thread: threading.Thread = None
 audio_stream_stop_event = threading.Event()
 AUDIO_RMS_THRESHOLD = 0.02 # Tune this threshold for VAD (e.g. 0.01 to 0.1)
+last_sent_speaking_status: bool = False # Initialize to False
+is_logically_muted: bool = False # Combines button mute and volume=0 mute
+DEFAULT_UNMUTE_VOLUME = 0.8 # Default volume when unmuting from volume=0 (0.0 to 1.0 for slider if max is 1, or 80 if max is 100)
 
 # --- Audio Playback Globals ---
 audio_output_stream: sd.OutputStream = None
@@ -73,6 +76,11 @@ is_audio_playback_active: bool = False
 # For simplicity, let's assume a common samplerate like 48000 for output.
 # The server should ideally inform clients of the audio format, or clients agree on one.
 PLAYBACK_SAMPLERATE = 48000 
+
+# --- Voice Activity Detection (Client-side timeout for card color) ---
+user_last_voice_activity_time = {} # Stores user_id: timestamp
+active_voice_activity_timers = {} # Stores user_id: asyncio.TimerHandle
+VOICE_ACTIVITY_TIMEOUT = 1.0  # Seconds before card returns to non-speaking color
 
 text_channels_data = {} 
 voice_channels_data = {} 
@@ -181,52 +189,52 @@ def _run_mic_test_loop(page_instance: ft.Page, input_dev_id: int, output_dev_id:
 # --- Audio Streaming Functions (Voice Chat) ---
 def _audio_stream_callback(indata, frames, time, status):
     """Callback for the main audio input stream."""
-    global is_mic_muted, current_voice_channel_id, sio_client, AUDIO_RMS_THRESHOLD, page, is_sending_audio
+    global is_logically_muted, current_voice_channel_id, sio_client, AUDIO_RMS_THRESHOLD, page, is_sending_audio, last_sent_speaking_status
 
     if status:
-        # Log significant statuses, but be mindful of log spam
-        if status.input_overflow or status.input_underflow or status.output_overflow or status.output_underflow:
+        if status.input_overflow or status.input_underflow:
             print(f"Audio Stream Callback Status Warning: {status}")
 
     if not is_sending_audio or not is_actively_in_voice_channel or current_voice_channel_id is None or not sio_client or not sio_client.connected or not page or not page.loop:
         return
 
-    if is_mic_muted:
-        # If muted, ensure server knows we are not speaking.
-        # This might be redundant if user_speaking_status is regularly sent,
-        # but good for ensuring state consistency on mute toggle.
+    # If logically muted, do not process or send audio/speaking status from VAD
+    if is_logically_muted:
+        # Ensure server knows we are not speaking if logically muted and status hasn't been sent
+        if last_sent_speaking_status:
+            try:
+                # print("[VAD DEBUG] Logically muted, ensuring server knows not speaking.")
+                asyncio.run_coroutine_threadsafe(
+                    sio_client.emit('user_speaking_status', {
+                        'channel_id': current_voice_channel_id,
+                        'speaking': False
+                    }),
+                    page.loop
+                )
+                last_sent_speaking_status = False
+            except Exception as e:
+                print(f"Error emitting speaking status (logically muted) from audio callback: {e}")
+        return
+
+    rms = np.linalg.norm(indata) / np.sqrt(len(indata.flat))
+    is_currently_speaking = rms > AUDIO_RMS_THRESHOLD
+
+    # Only emit speaking status if it has changed
+    if is_currently_speaking != last_sent_speaking_status:
         try:
+            # print(f"[VAD DEBUG] Speaking status changed to {is_currently_speaking}. Emitting.")
             asyncio.run_coroutine_threadsafe(
                 sio_client.emit('user_speaking_status', {
                     'channel_id': current_voice_channel_id,
-                    'speaking': False
+                    'speaking': is_currently_speaking
                 }),
                 page.loop
             )
+            last_sent_speaking_status = is_currently_speaking
         except Exception as e:
-            print(f"Error emitting speaking status (muted) from audio callback: {e}")
-        return
-
-    # VAD: Calculate RMS of the input data
-    # indata is a NumPy array. Assuming mono, so indata.shape might be (n_frames, 1) or (n_frames,)
-    rms = np.linalg.norm(indata) / np.sqrt(len(indata.flat)) # Use .flat for robust length calculation
-    is_currently_speaking = rms > AUDIO_RMS_THRESHOLD
-
-    # Emit speaking status
-    try:
-        asyncio.run_coroutine_threadsafe(
-            sio_client.emit('user_speaking_status', {
-                'channel_id': current_voice_channel_id,
-                'speaking': is_currently_speaking
-            }),
-            page.loop
-        )
-    except Exception as e:
-        print(f"Error emitting speaking status from audio callback: {e}")
+            print(f"Error emitting speaking status from audio callback: {e}")
 
     if is_currently_speaking:
-        # Send audio data (raw PCM as list of floats for now)
-        # Assuming mono, take the first channel or flatten if already mono
         audio_data_list = indata[:, 0].tolist() if indata.ndim > 1 else indata.tolist()
         try:
             asyncio.run_coroutine_threadsafe(
@@ -515,29 +523,28 @@ async def main(page: ft.Page):
         sorted_users_in_vc = sorted(current_voice_channel_active_users.values(), key=lambda u: u.get('username', '').lower())
         
         for user_data in sorted_users_in_vc:
-            is_user_actually_speaking = is_actively_in_voice_channel and user_data.get('speaking', False)
-
-            if is_user_actually_speaking:
-                user_card_text_color = COLOR_TEXT_ON_PURPLE # Should be ft.Colors.WHITE
-                user_card_icon_color = COLOR_ICON_ON_PURPLE   # Should be ft.Colors.WHITE
-                user_card_icon_name = ft.Icons.RECORD_VOICE_OVER
+            # Determine card color based on 'is_card_speaking' (from voice activity events and timeout)
+            if user_data.get('is_card_speaking', False):
+                user_card_text_color = COLOR_TEXT_ON_PURPLE 
+                user_card_icon_and_name_color = COLOR_ICON_ON_PURPLE # Icon and username text will be white on purple
                 user_card_bgcolor = COLOR_PRIMARY_PURPLE
                 user_card_border = None 
             else:
-                user_card_text_color = COLOR_TEXT_ON_WHITE # Should be COLOR_TEXT_DARK_PURPLE
-                user_card_icon_color = COLOR_ICON_ON_WHITE   # Should be COLOR_TEXT_DARK_PURPLE
-                user_card_icon_name = ft.Icons.VOICE_OVER_OFF
+                user_card_text_color = COLOR_TEXT_ON_WHITE 
+                user_card_icon_and_name_color = COLOR_ICON_ON_WHITE # Icon and username text will be dark purple on white
                 user_card_bgcolor = COLOR_BACKGROUND_WHITE 
                 user_card_border = ft.border.all(1, COLOR_DIVIDER_ON_WHITE) # Grey outline
 
+            # Determine mic icon based on 'mic_muted' (from user_speaking event)
+            mic_icon_name = ft.Icons.MIC_OFF if user_data.get('mic_muted', False) else ft.Icons.MIC
+
             user_display_row = ft.Row(
                 [
-                    ft.Icon(name=user_card_icon_name, color=user_card_icon_color, size=16),
-                    ft.Text(user_data.get('username', 'Unknown'), color=user_card_text_color, weight=ft.FontWeight.NORMAL, size=12)
+                    ft.Icon(name=mic_icon_name, color=user_card_icon_and_name_color, size=16),
+                    ft.Text(user_data.get('username', 'Unknown'), color=user_card_icon_and_name_color, weight=ft.FontWeight.NORMAL, size=12)
                 ],
                 alignment=ft.MainAxisAlignment.START,
                 spacing=5,
-                # vertical_alignment=ft.CrossAxisAlignment.CENTER # Ensure elements within the row are centered vertically
             )
 
             user_card = ft.Container(
@@ -597,7 +604,12 @@ async def main(page: ft.Page):
             global current_voice_channel_active_users
             current_voice_channel_active_users.clear()
             for user_info in data.get('users', []):
-                current_voice_channel_active_users[user_info['user_id']] = {'id': user_info['user_id'], 'username': user_info['username'], 'speaking': False}
+                current_voice_channel_active_users[user_info['user_id']] = {
+                    'id': user_info['user_id'], 
+                    'username': user_info['username'], 
+                    'mic_muted': False,  # Default to not muted, will be updated by 'user_speaking' event
+                    'is_card_speaking': False # Default to not actively speaking (for card color)
+                }
             update_voice_channel_user_list_ui()
 
     @sio_client.event
@@ -606,7 +618,12 @@ async def main(page: ft.Page):
         if channel_id_of_update == previewing_voice_channel_id: # And matches previewing_voice_channel_id
             user_id, username = data.get('user_id'), data.get('username')
             if user_id and username and user_id not in current_voice_channel_active_users:
-                current_voice_channel_active_users[user_id] = {'id': user_id, 'username': username, 'speaking': False}
+                current_voice_channel_active_users[user_id] = {
+                    'id': user_id, 
+                    'username': username, 
+                    'mic_muted': False, 
+                    'is_card_speaking': False
+                }
                 update_voice_channel_user_list_ui()
 
     @sio_client.event
@@ -616,47 +633,125 @@ async def main(page: ft.Page):
             user_id_left = data.get('user_id')
             if user_id_left in current_voice_channel_active_users:
                 del current_voice_channel_active_users[user_id_left]
+                 # Clean up activity timer for the user who left
+                if user_id_left in active_voice_activity_timers:
+                    active_voice_activity_timers[user_id_left].cancel()
+                    del active_voice_activity_timers[user_id_left]
+                if user_id_left in user_last_voice_activity_time:
+                    del user_last_voice_activity_time[user_id_left]
                 update_voice_channel_user_list_ui()
 
     @sio_client.event
-    async def user_speaking(data):
-        user_id, is_speaking_status, target_channel_id = data.get('user_id'), data.get('speaking'), data.get('channel_id')
-        if is_actively_in_voice_channel and target_channel_id == current_voice_channel_id and user_id in current_voice_channel_active_users:
-            current_voice_channel_active_users[user_id]['speaking'] = is_speaking_status
-            update_voice_channel_user_list_ui()
-    
+    async def user_speaking(data): # This event is now for MIC MUTED status
+        user_id, server_reported_unmuted_status, target_channel_id = data.get('user_id'), data.get('speaking'), data.get('channel_id')
+        # 'speaking' from server: True means unmuted, False means muted by client logic
+        if target_channel_id == current_voice_channel_id and user_id in current_voice_channel_active_users:
+            client_mic_muted_state = not server_reported_unmuted_status # mic_muted = True if server_reported_unmuted_status is False
+            if current_voice_channel_active_users[user_id].get('mic_muted') != client_mic_muted_state:
+                current_voice_channel_active_users[user_id]['mic_muted'] = client_mic_muted_state
+                # print(f"[DEBUG user_speaking event] User {user_id} mic_muted set to {client_mic_muted_state}")
+                update_voice_channel_user_list_ui() # Update UI for mic icon change
+
+    async def _handle_voice_activity_timeout(user_id):
+        """Called when a user's voice activity timer expires."""
+        global current_voice_channel_active_users, active_voice_activity_timers, page
+        # print(f"[VOICE_ACTIVITY] Timeout for user {user_id}.")
+        if user_id in current_voice_channel_active_users and current_voice_channel_active_users[user_id].get('is_card_speaking', False):
+            current_voice_channel_active_users[user_id]['is_card_speaking'] = False
+            # print(f"[VOICE_ACTIVITY] User {user_id} card updated to NOT speaking due to timeout.")
+            if page: # Ensure page is available before calling update_voice_channel_user_list_ui
+                 update_voice_channel_user_list_ui()
+            else:
+                 print("[VOICE_ACTIVITY] Page context not available for UI update on timeout.")
+        
+        # Clean up the finished timer handle
+        if user_id in active_voice_activity_timers:
+            del active_voice_activity_timers[user_id]
+
+    async def _start_voice_activity_timeout_task(user_id):
+        """Starts or restarts the voice activity timeout for a given user."""
+        global active_voice_activity_timers, VOICE_ACTIVITY_TIMEOUT, page
+        
+        if not page or not page.loop or not asyncio.get_event_loop().is_running():
+            # print(f"[VOICE_ACTIVITY] Event loop not running or page not available. Cannot start timer for user {user_id}.")
+            return
+
+        # Cancel existing timer for this user if any
+        if user_id in active_voice_activity_timers:
+            active_voice_activity_timers[user_id].cancel()
+            # print(f"[VOICE_ACTIVITY] Cancelled existing timer for user {user_id}")
+
+        def callback_wrapper(uid):
+            asyncio.create_task(_handle_voice_activity_timeout(uid))
+
+        timer_handle = page.loop.call_later(
+            VOICE_ACTIVITY_TIMEOUT, 
+            callback_wrapper, user_id
+        )
+        active_voice_activity_timers[user_id] = timer_handle
+        # print(f"[VOICE_ACTIVITY] Started/Reset timer for user {user_id} ({VOICE_ACTIVITY_TIMEOUT}s)")
+
+    @sio_client.event
+    async def user_voice_activity(data):
+        """Handles the new event from server indicating a user is actively sending voice."""
+        global current_voice_channel_active_users, user_last_voice_activity_time, page
+        
+        user_id = data.get('user_id')
+        is_active = data.get('active', False)
+        # print(f"[VOICE_ACTIVITY_EVENT] Received user_voice_activity: User {user_id}, Active: {is_active}")
+
+        if user_id and user_id in current_voice_channel_active_users:
+            if is_active:
+                if not current_voice_channel_active_users[user_id].get('is_card_speaking', False):
+                    current_voice_channel_active_users[user_id]['is_card_speaking'] = True
+                    # print(f"[VOICE_ACTIVITY_EVENT] User {user_id} card updated to SPEAKING.")
+                    if page: update_voice_channel_user_list_ui()
+                
+                current_loop = asyncio.get_event_loop()
+                if current_loop.is_running():
+                    user_last_voice_activity_time[user_id] = current_loop.time()
+                    await _start_voice_activity_timeout_task(user_id) 
+                # else:
+                    # print("[VOICE_ACTIVITY_EVENT] Event loop not running, cannot set activity time or start timer.")
+            # else: (Server currently doesn't send active:False for this event)
+                # pass 
+
     @sio_client.event
     async def voice_data_stream_chunk(data):
         """Handles incoming audio data chunks from other users."""
-        global audio_output_buffer, is_audio_playback_active, current_user_info, page, selected_output_device_id
+        global audio_output_buffer, is_audio_playback_active, current_user_info, page, selected_output_device_id, current_voice_channel_active_users, user_last_voice_activity_time
 
         if not is_audio_playback_active and is_actively_in_voice_channel:
-            # If we are in a voice channel but playback isn't active, try to start it.
-            # This might happen if it failed to start initially or was stopped due to an error.
-            print("Audio playback is not active while in a voice channel. Attempting to start playback stream.")
-            # Use selected_output_device_id, which _start_audio_playback_stream can use or fallback to default
-            await _start_audio_playback_stream(page, selected_output_device_id) 
+            # print("Audio playback is not active while in a voice channel. Attempting to start playback stream.")
+            if page: await _start_audio_playback_stream(page, selected_output_device_id) 
 
-        if not is_audio_playback_active: # Check again, if start failed, don't process
-            # print("Still no active playback stream after attempting to start. Discarding audio chunk.")
+        if not is_audio_playback_active:
             return
         
         sender_user_id = data.get('user_id')
-        # Crucial: Do not play back our own audio if server somehow sends it back
         if current_user_info and sender_user_id == current_user_info.get('id'):
             return
 
         audio_chunk_list = data.get('audio_data')
         if audio_chunk_list and isinstance(audio_chunk_list, list):
             try:
-                # Convert list of floats to NumPy array
+                if is_actively_in_voice_channel and sender_user_id in current_voice_channel_active_users:
+                    if not current_voice_channel_active_users[sender_user_id].get('is_card_speaking', False):
+                        current_voice_channel_active_users[sender_user_id]['is_card_speaking'] = True
+                        # print(f"[DEBUG voice_data_stream_chunk] User {sender_user_id} card updated to speaking.")
+                        if page: update_voice_channel_user_list_ui() 
+                    
+                    current_loop = asyncio.get_event_loop()
+                    if current_loop.is_running():
+                        user_last_voice_activity_time[sender_user_id] = current_loop.time()
+                        await _start_voice_activity_timeout_task(sender_user_id)
+                    # else:
+                        # print("[VOICE_DATA_STREAM_CHUNK] Event loop not running, cannot set activity time or start timer.")
+
                 audio_np_array = np.array(audio_chunk_list, dtype=np.float32)
                 await audio_output_buffer.put(audio_np_array)
-                # print(f"Received audio chunk from user {sender_user_id}, size: {len(audio_np_array)}, buffer size: {audio_output_buffer.qsize()}") # Debug
             except Exception as e:
                 print(f"Error processing or queuing audio chunk: {e}")
-        # else:
-            # print(f"Received voice_data_stream_chunk with invalid audio_data from user {sender_user_id}")
     
     @sio_client.event
     async def error(data):
@@ -882,28 +977,36 @@ async def main(page: ft.Page):
         # else: print("Output device selection did not change.")
 
     async def handle_mute_mic_click(e): 
-        global is_mic_muted, current_voice_channel_id, sio_client
-        is_mic_muted = not is_mic_muted
+        global is_mic_muted, current_voice_channel_id, sio_client, page, DEFAULT_UNMUTE_VOLUME
         
-        mute_button = active_page_controls.get('voice_settings_mute_button')
-        if mute_button:
-            mute_button.icon = ft.Icons.MIC_OFF if is_mic_muted else ft.Icons.MIC
-            mute_button.tooltip = "Unmute Microphone" if is_mic_muted else "Mute Microphone"
-            mute_button.update()
+        is_mic_muted = not is_mic_muted # Toggle the manual mute button state
+        # print(f"Mute button clicked. is_mic_muted is now: {is_mic_muted}")
 
-        print(f"Mic muted state: {is_mic_muted}")
-
-        if is_mic_muted and sio_client and sio_client.connected and current_voice_channel_id is not None:
-            try:
-                await sio_client.emit('user_speaking_status', {
-                    'channel_id': current_voice_channel_id, 
-                    'speaking': False 
-                })
-                print(f"Emitted user_speaking_status (false) due to mute for channel {current_voice_channel_id}")
-            except Exception as ex:
-                print(f"Error emitting user_speaking_status on mute: {ex}")
+        volume_slider = active_page_controls.get('voice_settings_input_volume_slider')
+        if not is_mic_muted: # If unmuting with the button
+            if volume_slider and volume_slider.value == 0:
+                # If volume was 0, set it to a default non-zero value upon button unmute
+                # Convert DEFAULT_UNMUTE_VOLUME (0-1) to slider scale (0-100)
+                new_volume = int(DEFAULT_UNMUTE_VOLUME * 100) 
+                volume_slider.value = new_volume
+                # print(f"Unmuted via button and volume was 0. Setting volume to {new_volume}")
+                if hasattr(volume_slider, 'update'): volume_slider.update()
         
-        if hasattr(page, 'update'): page.update()
+        # Update icon and tooltip will be handled by _update_and_send_mute_status
+        await _update_and_send_mute_status(page)
+        
+        # The following direct emit is now handled by _update_and_send_mute_status
+        # print(f"Mic muted state: {is_mic_muted}")
+        # if is_mic_muted and sio_client and sio_client.connected and current_voice_channel_id is not None:
+        #     try:
+        #         await sio_client.emit('user_speaking_status', {
+        #             'channel_id': current_voice_channel_id, 
+        #             'speaking': False 
+        #         })
+        #         print(f"Emitted user_speaking_status (false) due to mute for channel {current_voice_channel_id}")
+        #     except Exception as ex:
+        #         print(f"Error emitting user_speaking_status on mute: {ex}")
+        # if hasattr(page, 'update'): page.update() # _update_and_send_mute_status might call page.update via mute_button.update
 
     async def handle_mic_test_button_click(e):
         global is_mic_testing, selected_input_device_id, selected_output_device_id, mic_test_thread, mic_test_stop_event, mic_test_ui_update_task
@@ -1035,6 +1138,61 @@ async def main(page: ft.Page):
             # Ensure flag is reset even if thread was not alive or not an instance
             is_sending_audio = False 
             print("Audio stream was not running or already stopped.")
+
+    async def _update_and_send_mute_status(page_ref: ft.Page):
+        """Central function to update mute state and notify server."""
+        global is_mic_muted, is_logically_muted, sio_client, current_voice_channel_id, last_sent_speaking_status
+        
+        volume_slider = active_page_controls.get('voice_settings_input_volume_slider')
+        current_volume = 0
+        if volume_slider: # volume_slider.value is 0-100
+            current_volume = volume_slider.value 
+
+        # Determine logical mute state
+        new_logical_mute_state = is_mic_muted or (current_volume == 0)
+        
+        mute_button = active_page_controls.get('voice_settings_mute_button')
+        if mute_button:
+            mute_button.icon = ft.Icons.MIC_OFF if new_logical_mute_state else ft.Icons.MIC
+            mute_button.tooltip = "Unmute Microphone" if new_logical_mute_state else "Mute Microphone"
+            if hasattr(mute_button, 'update'): mute_button.update()
+
+        if new_logical_mute_state != is_logically_muted: # If logical mute state changed
+            is_logically_muted = new_logical_mute_state
+            print(f"Logical mute state changed to: {is_logically_muted}")
+
+            if sio_client and sio_client.connected and current_voice_channel_id is not None and is_actively_in_voice_channel:
+                # Always send speaking: False when logically muted
+                # Or send current VAD status if unmuted (but VAD callback will handle this if status changed)
+                speaking_to_send = False if is_logically_muted else last_sent_speaking_status # Fallback to last known if unmuting
+                try:
+                    print(f"Sending user_speaking_status: {speaking_to_send} due to logical mute change for channel {current_voice_channel_id}")
+                    await sio_client.emit('user_speaking_status', {
+                        'channel_id': current_voice_channel_id, 
+                        'speaking': speaking_to_send
+                    })
+                    last_sent_speaking_status = speaking_to_send # Update last sent status
+                except Exception as ex:
+                    print(f"Error emitting user_speaking_status on logical mute change: {ex}")
+        # else: print(f"Logical mute state did not change: {is_logically_muted}")
+
+    async def handle_input_volume_change(e):
+        """Handles changes from the input volume slider."""
+        global page # Make sure page is accessible
+        # print(f"Volume slider changed to: {e.control.value}") # Debug
+        # Slider value is 0-100. Convert to 0.0-1.0 if needed for other calcs, but keep as 0-100 for state.
+        
+        # If volume is set to 0, enforce mute button state
+        if e.control.value == 0:
+            global is_mic_muted
+            if not is_mic_muted: # If not already manually muted by button
+                is_mic_muted = True # Set button state to muted
+                # print("Volume set to 0, also setting is_mic_muted to True.")
+        # No automatic unmute of button if volume is raised from 0 by slider;
+        # user must click the unmute button if they muted via volume=0 then raised volume.
+        # This prevents unmuting if they were already intentionally muted by button.
+
+        await _update_and_send_mute_status(page) # Update based on new volume and existing button state
 
     active_page_controls['status_text'] = ft.Text(color=COLOR_STATUS_TEXT_MUTED) # Muted status text
     remember_me_checkbox = ft.Checkbox(label="记住我", value=app_config.get("remember_me", False),
@@ -1480,7 +1638,8 @@ async def main(page: ft.Page):
         min=0, max=100, divisions=100, value=100, 
         label="{value}%",
         active_color=COLOR_PRIMARY_PURPLE,
-        inactive_color=ft.Colors.with_opacity(0.3, COLOR_PRIMARY_PURPLE)
+        inactive_color=ft.Colors.with_opacity(0.3, COLOR_PRIMARY_PURPLE),
+        on_change=handle_input_volume_change # Assign the new handler
     )
     active_page_controls['voice_settings_mute_button'] = ft.IconButton(
         icon=ft.Icons.MIC,
@@ -1521,26 +1680,35 @@ async def main(page: ft.Page):
             ft.Divider(height=5, color=COLOR_DIVIDER_ON_WHITE),
             active_page_controls['voice_settings_input_device_dropdown'],
             active_page_controls['voice_settings_output_device_dropdown'],
-            active_page_controls['voice_settings_input_volume_slider'], # Slider directly added
-            ft.Row( # Mic test row, centered
+            # Row 1: Mute button and Volume slider
+            ft.Row(
+                [
+                    active_page_controls['voice_settings_mute_button'],
+                    ft.Container(
+                        content=active_page_controls['voice_settings_input_volume_slider'], 
+                        expand=True, 
+                        padding=ft.padding.only(left=8) # Space between mute icon and slider
+                    ) 
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=5 
+            ),
+            # Row 2: Mic test button, bar, and save button
+            ft.Row(
                 [
                     active_page_controls['voice_settings_mic_test_button'],
-                    active_page_controls['voice_settings_mic_test_bar']
+                    active_page_controls['voice_settings_mic_test_bar'], 
+                    active_page_controls['voice_settings_save_button']
                 ],
-                alignment=ft.MainAxisAlignment.CENTER, # Centered this row's content
+                alignment=ft.MainAxisAlignment.SPACE_AROUND, # Distributes space around items
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=10
-            ),
-            active_page_controls['voice_settings_mute_button'], # Mute button directly added
-            ft.Row( # Save button centered in a new Row
-                [active_page_controls['voice_settings_save_button']],
-                alignment=ft.MainAxisAlignment.CENTER
+                # spacing property is usually not combined with SPACE_AROUND/BETWEEN/EVENLY
             )
         ],
         visible=False,
-        spacing=8, # Reduced spacing
-        width=280,
-        horizontal_alignment=ft.CrossAxisAlignment.CENTER # Added horizontal alignment for the column
+        spacing=10, # Adjusted spacing for the column a bit for the new rows
+        width=280, # This width constraint might be tight for the second new row
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER 
     )
     active_page_controls['confirm_join_voice_button'] = ft.ElevatedButton(
         text="加入语音", icon=ft.Icons.CALL, 
