@@ -421,12 +421,11 @@ def handle_user_speaking_status(data):
 
     if channel_id is not None and is_unmuted is not None and user_id is not None:
         room_name = f"voice_channel_{channel_id}"
-        # This print log now clarifies it's about the client's reported unmuted/muteable status
-        print(f"[MUTE_STATUS_RELAY] User {user_id} reported unmuted_status: {is_unmuted} in channel {channel_id} (room: {room_name})") 
-        emit('user_speaking', # This event will be used by clients for the mic icon
+        # This print log now clarifies it's about the client's unmuted/muteable status
+        print(f"[USER_SPEAKING_STATUS] User {user_id} is_unmuted: {is_unmuted} in channel {channel_id} (room: {room_name})") 
+        emit('user_speaking', # This event name is kept for now, but it means "user_mic_status_update"
              {'channel_id': channel_id, 'user_id': user_id, 'speaking': is_unmuted}, 
-             room=room_name, 
-             skip_sid=request.sid)
+             room=room_name) # REMOVED: skip_sid=request.sid
 
 # WebSocket: 接收并转发语音数据流
 @socketio.on('voice_data_stream')
@@ -437,37 +436,27 @@ def handle_voice_data_stream(data):
         return
 
     channel_id = data.get('channel_id')
-    audio_data = data.get('audio_data') 
+    audio_data = data.get('audio_data') # This is a list of floats (samples)
     user_id = current_user.id
     username = current_user.username
 
     if channel_id is None or audio_data is None:
-        print(f"[VOICE_DATA_STREAM] Missing channel_id or audio_data from user {user_id}. Channel: {channel_id}, Data type: {type(audio_data)}")
-        emit('error', {'message': 'Voice data stream missing channel_id or audio_data.'}, room=request.sid)
+        print(f"[VOICE_DATA_STREAM] Missing channel_id or audio_data for user {user_id}. Discarding.")
         return
-
-    session = VoiceSession.query.filter_by(user_id=user_id, channel_id=channel_id).first()
-    if not session:
-        print(f"[VOICE_DATA_STREAM] User {user_id} ({username}) attempting to send voice data to channel {channel_id} they are not in (or session missing).")
-        return 
-
-    room_name = f"voice_channel_{channel_id}"
-    print(f"[VOICE_DATA_STREAM] User {user_id} ({username}) sent voice data to channel {channel_id} (room: {room_name}). Data length: {len(audio_data) if isinstance(audio_data, list) else 'N/A'}")
     
-    # NEW: Emit event to indicate this user is actively sending audio (for card color)
-    emit('user_voice_activity', {
-        'channel_id': channel_id,
-        'user_id': user_id,
-        'active': True # User is sending audio now
-    }, room=room_name, skip_sid=request.sid) # Other clients need this, sender already knows
+    room_name = f"voice_channel_{channel_id}"
+    # print(f"[VOICE_DATA_STREAM] User {user_id} ({username}) sending audio to channel {channel_id} (room: {room_name}). Chunk size: {len(audio_data)} samples.")
 
-    # Forward the actual audio data for playback
-    emit('voice_data_stream_chunk', {
-        'channel_id': channel_id,
-        'user_id': user_id,
-        'username': username, 
-        'audio_data': audio_data
-    }, room=room_name, skip_sid=request.sid)
+    # 1. Broadcast that this user is actively sending voice data (for card color change)
+    emit('user_voice_activity', 
+         {'channel_id': channel_id, 'user_id': user_id, 'username': username, 'active': True}, 
+         room=room_name) # REMOVED: skip_sid=request.sid
+
+    # 2. Forward the actual audio data chunk to others in the room
+    emit('voice_data_stream_chunk', 
+         {'channel_id': channel_id, 'user_id': user_id, 'username': username, 'audio_data': audio_data}, 
+         room=room_name, 
+         skip_sid=request.sid) # Still skip SID for the audio data itself to avoid self-playback of raw audio
 
 # WebSocket: WebRTC信令
 @socketio.on('voice_signal')
