@@ -11,6 +11,10 @@ app.config['SECRET_KEY'] = os.urandom(24)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///voicechat.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+# Constants for message loading
+INITIAL_MESSAGE_LOAD_COUNT = 20
+OLDER_MESSAGE_LOAD_COUNT = 20
+
 # 初始化扩展
 db.init_app(app)
 socketio = SocketIO(app)
@@ -273,7 +277,107 @@ def handle_disconnect():
 def handle_join_text_channel(data):
     channel_id = data['channel_id']
     join_room(f"text_channel_{channel_id}")
-    emit('user_joined_channel', {'user_id': current_user.id, 'username': current_user.username}, room=f"text_channel_{channel_id}")
+
+    # Fetch initial batch of messages (most recent ones)
+    historical_messages_query = Message.query.filter_by(channel_id=channel_id)\
+                                            .order_by(Message.timestamp.desc())\
+                                            .limit(INITIAL_MESSAGE_LOAD_COUNT)\
+                                            .all()
+    
+    # Messages are fetched in descending order (newest first), reverse them for chronological display
+    historical_messages_query.reverse() 
+
+    formatted_messages = []
+    for msg in historical_messages_query:
+        sender = User.query.get(msg.user_id)
+        formatted_messages.append({
+            'channel_id': msg.channel_id,
+            'message_id': msg.id, # Important for fetching older messages
+            'content': msg.content,
+            'username': sender.username if sender else 'Unknown User',
+            'user_id': msg.user_id,
+            'avatar_url': sender.avatar_url if sender else None,
+            'timestamp': msg.timestamp.strftime('%H:%M:%S'),
+            'timestamp_iso': msg.timestamp.isoformat() # Full ISO timestamp for precise comparison
+        })
+    
+    # Check if there might be more older messages
+    total_messages_in_channel = Message.query.filter_by(channel_id=channel_id).count()
+    has_more_older = total_messages_in_channel > len(formatted_messages)
+
+    emit('load_historical_messages', {
+        'channel_id': channel_id,
+        'messages': formatted_messages,
+        'has_more_older': has_more_older
+    }, room=request.sid)
+
+    print(f"User {current_user.username} joined text channel {channel_id}, sent {len(formatted_messages)} initial messages. Has more: {has_more_older}")
+
+@socketio.on('request_older_messages')
+def handle_request_older_messages(data):
+    if not current_user.is_authenticated:
+        return
+
+    channel_id = data.get('channel_id')
+    before_message_id = data.get('before_message_id') # Client should send the ID of the oldest message it has
+    # Alternatively, client could send `before_timestamp_iso`
+    limit_count = data.get('limit', OLDER_MESSAGE_LOAD_COUNT)
+
+    if not channel_id or not before_message_id:
+        emit('error', {'message': 'Channel ID and before_message_id are required to load older messages.'}, room=request.sid)
+        return
+
+    oldest_message_on_client = Message.query.get(before_message_id)
+    if not oldest_message_on_client:
+        emit('older_messages_loaded', {
+            'channel_id': channel_id,
+            'messages': [],
+            'has_more_older': False # Cannot find the reference message
+        }, room=request.sid)
+        return
+
+    older_messages_query = Message.query.filter(
+                                        Message.channel_id == channel_id,
+                                        Message.timestamp < oldest_message_on_client.timestamp
+                                    )\
+                                    .order_by(Message.timestamp.desc())\
+                                    .limit(limit_count)\
+                                    .all()
+    
+    older_messages_query.reverse() # Reverse for chronological order
+
+    formatted_older_messages = []
+    for msg in older_messages_query:
+        sender = User.query.get(msg.user_id)
+        formatted_older_messages.append({
+            'channel_id': msg.channel_id,
+            'message_id': msg.id,
+            'content': msg.content,
+            'username': sender.username if sender else 'Unknown User',
+            'user_id': msg.user_id,
+            'avatar_url': sender.avatar_url if sender else None,
+            'timestamp': msg.timestamp.strftime('%H:%M:%S'),
+            'timestamp_iso': msg.timestamp.isoformat()
+        })
+
+    # Check if there are even more messages older than this batch
+    # This check can be more precise by looking for a message older than the oldest one in the current batch sent
+    has_even_more_older = False
+    if older_messages_query: # If we found any older messages in this batch
+        oldest_in_batch_timestamp = older_messages_query[0].timestamp # Since it's chronological now, first is oldest
+        more_exist_check = Message.query.filter(
+            Message.channel_id == channel_id,
+            Message.timestamp < oldest_in_batch_timestamp
+        ).first()
+        if more_exist_check:
+            has_even_more_older = True
+            
+    emit('older_messages_loaded', {
+        'channel_id': channel_id,
+        'messages': formatted_older_messages,
+        'has_more_older': has_even_more_older 
+    }, room=request.sid)
+    print(f"Sent {len(formatted_older_messages)} older messages to {current_user.username} for channel {channel_id}. Has more: {has_even_more_older}")
 
 # WebSocket: 发送消息
 @socketio.on('send_message')

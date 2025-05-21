@@ -88,6 +88,16 @@ current_chat_messages = []
 all_server_users = [] 
 current_voice_channel_active_users = {} # Users in the PREVIEWING or ACTIVE voice channel
 
+# --- Chat Message State ---
+current_chat_messages_data = [] # Holds full dicts of current chat messages
+oldest_message_id_loaded = None # ID of the oldest message currently loaded
+has_more_older_messages_to_load = False # Flag if server indicates more older messages exist
+is_loading_older_messages = False # Flag to prevent duplicate load requests
+
+# --- Constants for message loading (client-side) ---
+INITIAL_MESSAGE_LOAD_COUNT = 20 # Matches server, but not strictly necessary for client to define if server controls initial load size
+OLDER_MESSAGE_LOAD_COUNT = 20   # Number of older messages to request each time
+
 # --- Config Helper Functions ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -591,15 +601,18 @@ async def main(page: ft.Page):
     
     @sio_client.event
     async def new_message(data):
-        if data.get('channel_id') == current_text_channel_id and active_page_controls.get('chat_messages_view'):
-            active_page_controls['chat_messages_view'].controls.append(
-                ft.Text(f"[{data.get('timestamp')}] {data.get('username')}: {data.get('content')}", 
-                        selectable=True, 
-                        font_family="Consolas", 
-                        color=COLOR_TEXT_ON_WHITE # Explicitly set text color for messages
-                       ) 
-            )
-            active_page_controls['chat_messages_view'].update()
+        global current_text_channel_id, current_chat_messages_data
+        if data.get('channel_id') == current_text_channel_id:
+            # Standardize message format if needed, assuming server sends it in the same format as historical
+            current_chat_messages_data.append(data) # Add to our internal data list
+            _render_chat_messages() # Re-render the whole list (could be optimized to just append)
+            
+            # Auto-scroll logic for new messages (if auto_scroll=True on ListView isn't enough)
+            # chat_view = active_page_controls.get('chat_messages_view')
+            # if chat_view and hasattr(chat_view, 'update'): 
+            #     chat_view.update() # Ensure new control is in the list
+            #     # Delay slightly then scroll if needed? Flet ListView behavior needs testing here.
+            #     # Or rely on ListView's auto_scroll=True property.
 
     @sio_client.event
     async def voice_channel_users(data): # Users in a specific voice channel (could be due to our join or other updates)
@@ -1336,7 +1349,7 @@ async def main(page: ft.Page):
 
 
     async def select_text_channel(page_ref: ft.Page, channel_id: int, channel_name: str):
-        global current_text_channel_id
+        global current_text_channel_id, current_chat_messages_data, oldest_message_id_loaded, has_more_older_messages_to_load, is_loading_older_messages
         
         chat_panel = active_page_controls.get('chat_panel_content_group')
         # If already on this text channel and its view is visible, do nothing
@@ -1346,6 +1359,12 @@ async def main(page: ft.Page):
         print(f"Selecting text channel: {channel_name} (ID: {channel_id})")
         current_text_channel_id = channel_id
         
+        # Reset chat message state for the new channel
+        current_chat_messages_data.clear()
+        oldest_message_id_loaded = None
+        has_more_older_messages_to_load = False
+        is_loading_older_messages = False
+
         # Switch middle panel to text view
         switch_middle_panel_view("text", channel_name)
         
@@ -1877,6 +1896,148 @@ async def main(page: ft.Page):
         if active_page_controls.get('status_text'): active_page_controls['status_text'].value = "Auto-login..."
         if hasattr(page, 'update'): page.update()
         await attempt_login(None, is_auto_login=True)
+
+    def _create_chat_message_control(msg_data):
+        """Helper to create a Flet control for a single chat message."""
+        # Customize this function to change how messages are displayed
+        # For now, a simple Text control. You might want Rows with Avatars, Usernames, Timestamps etc.
+        return ft.Text(
+            f"[{msg_data.get('timestamp')}] {msg_data.get('username', 'Unknown')}: {msg_data.get('content')}", 
+            selectable=True, 
+            font_family="Consolas", 
+            color=COLOR_TEXT_ON_WHITE
+        )
+
+    def _render_chat_messages():
+        """Renders messages from current_chat_messages_data to the chat_messages_view."""
+        global current_chat_messages_data, active_page_controls, has_more_older_messages_to_load, is_loading_older_messages
+        chat_view = active_page_controls.get('chat_messages_view')
+        if not chat_view: return
+
+        chat_view.controls.clear() # Clear existing visual controls
+
+        # Add "Load More" button if applicable
+        if has_more_older_messages_to_load and not is_loading_older_messages:
+            load_more_button = ft.TextButton(
+                "Load Earlier Messages...",
+                icon=ft.Icons.ARROW_UPWARD,
+                on_click=lambda e: page.run_task(request_older_messages_from_ui), # We'll define this function later
+                style=ft.ButtonStyle(color=COLOR_PRIMARY_PURPLE)
+            )
+            chat_view.controls.append(load_more_button)
+        elif is_loading_older_messages: # Show a loading indicator
+            loading_indicator = ft.Row(
+                [ft.ProgressRing(width=16, height=16, stroke_width=2), ft.Text("Loading...", color=COLOR_TEXT_ON_WHITE)],
+                alignment=ft.MainAxisAlignment.CENTER
+            )
+            chat_view.controls.append(loading_indicator)
+
+        for msg_data in current_chat_messages_data: # current_chat_messages_data should be in chronological order
+            chat_view.controls.append(_create_chat_message_control(msg_data))
+        
+        if hasattr(chat_view, 'update'): chat_view.update()
+        # Consider page.update() if individual control update is not enough, but try to avoid.
+
+    async def request_older_messages_from_ui(e=None): # e=None for direct calls too
+        """Called when the user initiates a request to load older messages."""
+        global is_loading_older_messages, oldest_message_id_loaded, current_text_channel_id, sio_client, page
+
+        if is_loading_older_messages or oldest_message_id_loaded is None or current_text_channel_id is None or not sio_client or not sio_client.connected:
+            if is_loading_older_messages:
+                print("[LOAD_MORE] Already loading older messages.")
+            if oldest_message_id_loaded is None:
+                print("[LOAD_MORE] No oldest_message_id_loaded, cannot request older.")
+            return
+
+        print(f"[LOAD_MORE] Requesting older messages for channel {current_text_channel_id} before message ID {oldest_message_id_loaded}")
+        is_loading_older_messages = True
+        _render_chat_messages() # Update UI to show loading indicator
+        if hasattr(page, 'update'): page.update() # Ensure UI update for loading indicator is processed
+
+        try:
+            await sio_client.emit('request_older_messages', {
+                'channel_id': current_text_channel_id,
+                'before_message_id': oldest_message_id_loaded,
+                'limit': OLDER_MESSAGE_LOAD_COUNT
+            })
+        except Exception as ex:
+            print(f"[LOAD_MORE] Error emitting request_older_messages: {ex}")
+            is_loading_older_messages = False # Reset flag on error
+            _render_chat_messages() # Re-render to remove loading indicator
+            if hasattr(page, 'update'): page.update()
+
+    @sio_client.event
+    async def older_messages_loaded(data):
+        """Handles a batch of older messages received from the server."""
+        global current_text_channel_id, current_chat_messages_data, oldest_message_id_loaded, has_more_older_messages_to_load, is_loading_older_messages, page
+
+        # Basic log to see if event is hit and what the first message might be for context
+        # print(f"[LOAD_MORE] Received 'older_messages_loaded' event. First content: {data.get('messages',[{}])[0].get('content', 'NO_CONTENT')}... and {len(data.get('messages',[]))-1} more. Has more from server: {data.get('has_more_older')}") 
+
+        is_loading_older_messages = False # Finished loading this batch, always reset
+
+        channel_id = data.get('channel_id')
+        if channel_id != current_text_channel_id:
+            print(f"[LOAD_MORE] Received older messages for channel {channel_id}, but current is {current_text_channel_id}. Ignoring.")
+            # Still re-render, as is_loading_older_messages changed, which might affect UI (loading indicator)
+            _render_chat_messages() 
+            if hasattr(page, 'update'): page.update()
+            return
+
+        older_msgs = data.get('messages', [])
+        # Server should send them in chronological order already (oldest first in this batch)
+
+        if older_msgs:
+            current_chat_messages_data = older_msgs + current_chat_messages_data
+            oldest_message_id_loaded = older_msgs[0].get('message_id') 
+            print(f"[LOAD_MORE] Prepended {len(older_msgs)} older messages. New oldest ID: {oldest_message_id_loaded}")
+        else:
+            print("[LOAD_MORE] Received no older messages in this batch from server.")
+            # If server sends an empty list, it implies no more messages older than what client referenced.
+            # The has_more_older flag from server is the ultimate truth for the button.
+
+        has_more_older_messages_to_load = data.get('has_more_older', False)
+        print(f"[LOAD_MORE] UI will now reflect has_more_older: {has_more_older_messages_to_load}")
+        
+        _render_chat_messages() 
+        if hasattr(page, 'update'): page.update()
+
+        # Scroll position adjustment would go here if implemented
+
+    @sio_client.event
+    async def load_historical_messages(data):
+        """Handles the initial batch of historical messages from the server."""
+        global current_text_channel_id, current_chat_messages_data, oldest_message_id_loaded, has_more_older_messages_to_load, page
+        
+        channel_id = data.get('channel_id')
+        if channel_id != current_text_channel_id:
+            print(f"[HISTORY] Received historical messages for channel {channel_id}, but current channel is {current_text_channel_id}. Ignoring.")
+            return
+
+        messages = data.get('messages', [])
+        current_chat_messages_data = messages # Replace current data with this initial batch
+        has_more_older_messages_to_load = data.get('has_more_older', False)
+        
+        if messages: # If any messages were loaded
+            oldest_message_id_loaded = messages[0].get('message_id') # First message is the oldest in this batch
+        else:
+            oldest_message_id_loaded = None # No messages, so no oldest ID
+
+        print(f"[HISTORY] Loaded {len(messages)} historical messages for channel {channel_id}. Oldest ID: {oldest_message_id_loaded}. Has more: {has_more_older_messages_to_load}")
+        _render_chat_messages() # Render all messages (including the new history)
+        
+        # Auto-scroll to bottom after initial load (if ListView supports it well)
+        chat_view = active_page_controls.get('chat_messages_view')
+        if chat_view and hasattr(chat_view, 'scroll_to_end') and callable(chat_view.scroll_to_end):
+            # print("[HISTORY] Attempting to scroll to end of chat view.")
+            # Flet's ListView auto_scroll might handle this if set, direct scroll_to_end might not be needed
+            # or might conflict. If auto_scroll=True is used, this might be redundant.
+            # For now, let's rely on auto_scroll property of ListView. If not sufficient, then explore direct calls.
+            # chat_view.scroll_to_end() # This might need to be called after an update cycle
+            pass
+            
+        # Ensure main page updates if necessary to reflect changes
+        if hasattr(page, 'update'): page.update() 
 
 if __name__ == "__main__":
     ft.app(target=main) 
