@@ -201,40 +201,42 @@ def _audio_stream_callback(indata, frames, time, status):
     # If logically muted, do not process or send audio/speaking status from VAD
     if is_logically_muted:
         # Ensure server knows we are not speaking if logically muted and status hasn't been sent
-        if last_sent_speaking_status:
+        if last_sent_speaking_status: # last_sent_speaking_status is True if last VAD was speaking
             try:
                 # print("[VAD DEBUG] Logically muted, ensuring server knows not speaking.")
                 asyncio.run_coroutine_threadsafe(
-                    sio_client.emit('user_speaking_status', {
+                    sio_client.emit('user_microphone_status', { # RENAMED event
                         'channel_id': current_voice_channel_id,
-                        'speaking': False
+                        'is_unmuted': False # CHANGED key and value indicates muted
                     }),
                     page.loop
                 )
-                last_sent_speaking_status = False
+                last_sent_speaking_status = False # Reflect that we've sent a 'muted' (not speaking) status
             except Exception as e:
                 print(f"Error emitting speaking status (logically muted) from audio callback: {e}")
         return
 
     rms = np.linalg.norm(indata) / np.sqrt(len(indata.flat))
-    is_currently_speaking = rms > AUDIO_RMS_THRESHOLD
+    is_currently_speaking_vad = rms > AUDIO_RMS_THRESHOLD # VAD based on RMS
 
-    # Only emit speaking status if it has changed
-    if is_currently_speaking != last_sent_speaking_status:
+    # This 'speaking' status is about VAD activity while unmuted.
+    # The server interprets this as 'is_unmuted_and_active'.
+    # We only send if this VAD-based status changes.
+    if is_currently_speaking_vad != last_sent_speaking_status:
         try:
-            # print(f"[VAD DEBUG] Speaking status changed to {is_currently_speaking}. Emitting.")
+            # print(f"[VAD DEBUG] Speaking status changed to {is_currently_speaking_vad}. Emitting.")
             asyncio.run_coroutine_threadsafe(
-                sio_client.emit('user_speaking_status', {
+                sio_client.emit('user_microphone_status', { # RENAMED event
                     'channel_id': current_voice_channel_id,
-                    'speaking': is_currently_speaking
+                    'is_unmuted': is_currently_speaking_vad # CHANGED key; True if VAD active, False if VAD inactive
                 }),
                 page.loop
             )
-            last_sent_speaking_status = is_currently_speaking
+            last_sent_speaking_status = is_currently_speaking_vad
         except Exception as e:
             print(f"Error emitting speaking status from audio callback: {e}")
 
-    if is_currently_speaking:
+    if is_currently_speaking_vad: # Only send audio if VAD is active
         audio_data_list = indata[:, 0].tolist() if indata.ndim > 1 else indata.tolist()
         try:
             asyncio.run_coroutine_threadsafe(
@@ -311,9 +313,9 @@ def _run_audio_stream_loop(input_dev_id: int, stop_event: threading.Event, page_
             try:
                 print("Sending final 'not speaking' status from audio loop finally block.")
                 asyncio.run_coroutine_threadsafe(
-                    sio_client.emit('user_speaking_status', {
+                    sio_client.emit('user_microphone_status', { # RENAMED event
                         'channel_id': current_voice_channel_id,
-                        'speaking': False
+                        'is_unmuted': False # CHANGED key and value indicates muted/not speaking
                     }),
                     page_instance_ref.loop
                 )
@@ -651,6 +653,35 @@ async def main(page: ft.Page):
                 current_voice_channel_active_users[user_id]['mic_muted'] = client_mic_muted_state
                 # print(f"[DEBUG user_speaking event] User {user_id} mic_muted set to {client_mic_muted_state}")
                 update_voice_channel_user_list_ui() # Update UI for mic icon change
+
+    @sio_client.event
+    async def on_user_mic_status_updated(data): # RENAMED event handler and function name
+        """Handles mic status updates from the server (e.g., other users muting/unmuting)."""
+        # This event ('user_mic_status_updated') is received from the server.
+        # The payload from server is: {'channel_id': ..., 'user_id': ..., 'is_unmuted': ...}
+        
+        user_id = data.get('user_id')
+        server_reported_is_unmuted = data.get('is_unmuted') # CHANGED key from 'speaking'
+        target_channel_id = data.get('channel_id')
+
+        # print(f"[on_user_mic_status_updated] Received: user {user_id}, is_unmuted: {server_reported_is_unmuted}, channel: {target_channel_id}")
+
+        # current_voice_channel_id can be None if user is not in any VC or only previewing.
+        # is_actively_in_voice_channel ensures we only care about updates for the channel we are *actively* in.
+        # However, the server broadcasts to the room, so even if we are just previewing, we might get this.
+        # We should update the mic_muted status for users in `current_voice_channel_active_users`
+        # which now refers to users in the `previewing_voice_channel_id` or `current_voice_channel_id`.
+
+        if target_channel_id == previewing_voice_channel_id and user_id in current_voice_channel_active_users:
+            if server_reported_is_unmuted is not None: # Ensure the key was present
+                client_mic_muted_state = not server_reported_is_unmuted # mic_muted = True if server_reported_is_unmuted is False
+                
+                if current_voice_channel_active_users[user_id].get('mic_muted') != client_mic_muted_state:
+                    current_voice_channel_active_users[user_id]['mic_muted'] = client_mic_muted_state
+                    # print(f"[on_user_mic_status_updated] User {user_id} mic_muted in UI set to {client_mic_muted_state}")
+                    update_voice_channel_user_list_ui() # Update UI for mic icon change
+        # else:
+            # print(f"[on_user_mic_status_updated] Ignoring event: target_ch: {target_channel_id} vs preview_ch: {previewing_voice_channel_id}, user {user_id} in active_users: {user_id in current_voice_channel_active_users}")
 
     async def _handle_voice_activity_timeout(user_id):
         """Called when a user's voice activity timer expires."""
@@ -1162,18 +1193,35 @@ async def main(page: ft.Page):
             print(f"Logical mute state changed to: {is_logically_muted}")
 
             if sio_client and sio_client.connected and current_voice_channel_id is not None and is_actively_in_voice_channel:
-                # Always send speaking: False when logically muted
-                # Or send current VAD status if unmuted (but VAD callback will handle this if status changed)
-                speaking_to_send = False if is_logically_muted else last_sent_speaking_status # Fallback to last known if unmuting
+                # When logical mute state changes, we inform the server about our "unmuted" capability.
+                # If logically muted, we send is_unmuted: False.
+                # If unmuted, the VAD callback (_audio_stream_callback) is responsible for sending is_unmuted based on actual voice activity.
+                # However, if we are just unmuting the button (and volume is > 0), 
+                # and VAD was previously silent (last_sent_speaking_status = False), 
+                # we should probably send an is_unmuted: True here to indicate we *can* speak now,
+                # even if VAD hasn't picked up sound *yet*.
+                # The server's `user_mic_status_updated` will then correctly show the mic icon as unmuted.
+                
+                # Let's simplify: if logically_muted, always send False. 
+                # If un-logically_muted, the VAD will shortly send True if speaking, or False if not.
+                # To ensure the mic icon updates quickly on unmute (even before VAD detects speech),
+                # we can send 'is_unmuted': True when is_logically_muted becomes False.
+                
+                speaking_payload_value = not is_logically_muted # True if unmuted, False if muted
+
                 try:
-                    print(f"Sending user_speaking_status: {speaking_to_send} due to logical mute change for channel {current_voice_channel_id}")
-                    await sio_client.emit('user_speaking_status', {
+                    # print(f"Sending user_microphone_status: {speaking_payload_value} due to logical mute change for channel {current_voice_channel_id}")
+                    await sio_client.emit('user_microphone_status', { # RENAMED event
                         'channel_id': current_voice_channel_id, 
-                        'speaking': speaking_to_send
+                        'is_unmuted': speaking_payload_value # CHANGED key
                     })
-                    last_sent_speaking_status = speaking_to_send # Update last sent status
+                    # `last_sent_speaking_status` is managed by VAD, so we don't directly set it here based on button mute.
+                    # If we just unmuted, and VAD was already sending 'true' (last_sent_speaking_status = true), this emit is fine.
+                    # If we just unmuted, and VAD was sending 'false', this 'is_unmuted: true' will correct the mic icon,
+                    # and VAD will continue to send 'is_unmuted: false' (if no sound) or 'is_unmuted: true' (if sound).
+
                 except Exception as ex:
-                    print(f"Error emitting user_speaking_status on logical mute change: {ex}")
+                    print(f"Error emitting user_microphone_status on logical mute change: {ex}")
         # else: print(f"Logical mute state did not change: {is_logically_muted}")
 
     async def handle_input_volume_change(e):

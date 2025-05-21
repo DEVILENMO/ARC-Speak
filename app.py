@@ -412,20 +412,21 @@ def handle_leave_voice_channel(data): # Expecting data to contain channel_id fro
         else:
             print(f"User {current_user.username} requested leave_voice_channel but no active session found and no channel_id provided.")
 
-# WebSocket: 用户说话状态更新
-@socketio.on('user_speaking_status')
-def handle_user_speaking_status(data):
-    channel_id = data.get('channel_id') # Client sends this
-    is_unmuted = data.get('speaking') # True if client is not logically muted, False if muted
+# WebSocket: 接收客户端的麦克风状态更新 (是否静音)
+@socketio.on('user_microphone_status')
+def handle_user_microphone_status(data):
+    channel_id = data.get('channel_id')
+    is_unmuted = data.get('is_unmuted')
     user_id = current_user.id
 
     if channel_id is not None and is_unmuted is not None and user_id is not None:
         room_name = f"voice_channel_{channel_id}"
-        # This print log now clarifies it's about the client's unmuted/muteable status
-        print(f"[USER_SPEAKING_STATUS] User {user_id} is_unmuted: {is_unmuted} in channel {channel_id} (room: {room_name})") 
-        emit('user_speaking', # This event name is kept for now, but it means "user_mic_status_update"
-             {'channel_id': channel_id, 'user_id': user_id, 'speaking': is_unmuted}, 
-             room=room_name) # REMOVED: skip_sid=request.sid
+        print(f"[USER_MICROPHONE_STATUS] User {user_id} is_unmuted: {is_unmuted} in channel {channel_id} (room: {room_name})") 
+        
+        # Broadcast the updated mic status to all clients in the room (including sender)
+        emit('user_mic_status_updated',
+             {'channel_id': channel_id, 'user_id': user_id, 'is_unmuted': is_unmuted},
+             room=room_name)
 
 # WebSocket: 接收并转发语音数据流
 @socketio.on('voice_data_stream')
