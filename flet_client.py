@@ -525,6 +525,7 @@ async def main(page: ft.Page):
         sorted_users_in_vc = sorted(current_voice_channel_active_users.values(), key=lambda u: u.get('username', '').lower())
         
         for user_data in sorted_users_in_vc:
+            print(f"[DEBUG update_voice_channel_user_list_ui] Processing user: {user_data.get('username')}, mic_muted: {user_data.get('mic_muted')}, is_card_speaking: {user_data.get('is_card_speaking')}") # DEBUG
             # Determine card color based on 'is_card_speaking' (from voice activity events and timeout)
             if user_data.get('is_card_speaking', False):
                 user_card_text_color = COLOR_TEXT_ON_PURPLE 
@@ -539,6 +540,7 @@ async def main(page: ft.Page):
 
             # Determine mic icon based on 'mic_muted' (from user_speaking event)
             mic_icon_name = ft.Icons.MIC_OFF if user_data.get('mic_muted', False) else ft.Icons.MIC
+            print(f"[DEBUG update_voice_channel_user_list_ui] User: {user_data.get('username')}, Mic Icon Name: {mic_icon_name}") # DEBUG
 
             user_display_row = ft.Row(
                 [
@@ -655,8 +657,9 @@ async def main(page: ft.Page):
                 update_voice_channel_user_list_ui() # Update UI for mic icon change
 
     @sio_client.event
-    async def on_user_mic_status_updated(data): # RENAMED event handler and function name
+    async def user_mic_status_updated(data): # RENAMED: Removed "on_" prefix
         """Handles mic status updates from the server (e.g., other users muting/unmuting)."""
+        print(f"[DEBUG user_mic_status_updated] Received event. Data: {data}") # DEBUG
         # This event ('user_mic_status_updated') is received from the server.
         # The payload from server is: {'channel_id': ..., 'user_id': ..., 'is_unmuted': ...}
         
@@ -678,7 +681,7 @@ async def main(page: ft.Page):
                 
                 if current_voice_channel_active_users[user_id].get('mic_muted') != client_mic_muted_state:
                     current_voice_channel_active_users[user_id]['mic_muted'] = client_mic_muted_state
-                    # print(f"[on_user_mic_status_updated] User {user_id} mic_muted in UI set to {client_mic_muted_state}")
+                    print(f"[DEBUG user_mic_status_updated] User {user_id} in channel {target_channel_id}, mic_muted set to: {current_voice_channel_active_users[user_id]['mic_muted']}") # DEBUG
                     update_voice_channel_user_list_ui() # Update UI for mic icon change
         # else:
             # print(f"[on_user_mic_status_updated] Ignoring event: target_ch: {target_channel_id} vs preview_ch: {previewing_voice_channel_id}, user {user_id} in active_users: {user_id in current_voice_channel_active_users}")
