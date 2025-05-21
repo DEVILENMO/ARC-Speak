@@ -65,6 +65,15 @@ audio_stream_thread: threading.Thread = None
 audio_stream_stop_event = threading.Event()
 AUDIO_RMS_THRESHOLD = 0.02 # Tune this threshold for VAD (e.g. 0.01 to 0.1)
 
+# --- Audio Playback Globals ---
+audio_output_stream: sd.OutputStream = None
+audio_output_buffer = asyncio.Queue()
+is_audio_playback_active: bool = False
+# It's good practice to define a fixed playback samplerate, or ensure it matches input if possible.
+# For simplicity, let's assume a common samplerate like 48000 for output.
+# The server should ideally inform clients of the audio format, or clients agree on one.
+PLAYBACK_SAMPLERATE = 48000 
+
 text_channels_data = {} 
 voice_channels_data = {} 
 current_chat_messages = [] 
@@ -304,6 +313,146 @@ def _run_audio_stream_loop(input_dev_id: int, stop_event: threading.Event, page_
                 print(f"Error sending final speaking status: {e}")
         print("Audio stream loop finished.")
 
+# --- Audio Playback Functions (Receiving Voice Chat) ---
+def _audio_playback_callback(outdata, frames, time, status):
+    """Callback for the audio output stream."""
+    global audio_output_buffer, is_audio_playback_active
+
+    if status.output_underflow:
+        print("Output underflow: Playback stream isn't getting data fast enough!")
+    if status:
+        # print(f"Audio Playback Callback Status: {status}") # Can be very verbose
+        pass 
+
+    if not is_audio_playback_active:
+        outdata[:] = 0 # Output silence if playback is not active
+        return
+
+    try:
+        # Try to get a block of data from the buffer without waiting indefinitely
+        data_block = audio_output_buffer.get_nowait()
+        # Ensure data_block is a NumPy array and has the correct shape for outdata
+        if not isinstance(data_block, np.ndarray):
+            # This shouldn't happen if we put NumPy arrays into the queue
+            print(f"Warning: Data in playback buffer is not a NumPy array. Type: {type(data_block)}")
+            outdata[:] = 0
+            return
+
+        # Check if the retrieved block is shorter than required frames
+        if len(data_block) < frames:
+            # Pad with zeros if data is shorter
+            outdata[:len(data_block)] = data_block.reshape(-1, 1) # Reshape to (n, 1) for mono
+            outdata[len(data_block):] = 0
+            # print(f"Playback: Got {len(data_block)} frames, needed {frames}. Padded.") # Debug
+        else:
+            # If data_block is long enough, use the required number of frames
+            outdata[:] = data_block[:frames].reshape(-1, 1) # Reshape to (n, 1) for mono
+            # Put the rest back if it's too long (though ideally blocks are pre-sized)
+            if len(data_block) > frames:
+                # This part can be tricky with asyncio.Queue; simpler to assume blocks are consumable
+                # print(f"Warning: Playback data_block {len(data_block)} longer than frames {frames}. Truncating.")
+                pass # For now, just use the frames needed
+        audio_output_buffer.task_done() # Notify queue that item processing is complete
+    except asyncio.QueueEmpty:
+        # Buffer is empty, output silence
+        outdata[:] = 0
+        # print("Playback buffer empty, outputting silence.") # Debug
+    except Exception as e:
+        print(f"Error in audio playback callback: {e}")
+        outdata[:] = 0 # Output silence on error
+
+async def _start_audio_playback_stream(page_ref: ft.Page, output_device_idx: int = None):
+    """Helper function to start the audio playback stream."""
+    global audio_output_stream, is_audio_playback_active, PLAYBACK_SAMPLERATE, sd, SOUNDDEVICE_AVAILABLE
+
+    if not SOUNDDEVICE_AVAILABLE or sd is None:
+        print("Cannot start audio playback: Sounddevice not available.")
+        # Optionally show a snackbar if page_ref is valid
+        return
+
+    # Determine output device
+    actual_output_device_id = output_device_idx
+    if actual_output_device_id is None: # If no specific device, try to use sounddevice's default
+        try:
+            default_devices = sd.default.device
+            actual_output_device_id = default_devices[1] if isinstance(default_devices, (list, tuple)) and len(default_devices) > 1 else default_devices
+            print(f"No output device specified for playback, using system default: {actual_output_device_id}")
+        except Exception as e:
+            print(f"Error getting default output device: {e}. Playback cannot start.")
+            # Show snackbar error
+            if hasattr(page_ref, 'overlay'):
+                sb = ft.SnackBar(ft.Text("Failed to get default audio output device.", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.RED_ACCENT_700, open=True)
+                page_ref.overlay.append(sb)
+                if hasattr(page_ref, 'update'): page_ref.update()
+            return
+
+    if is_audio_playback_active and audio_output_stream and audio_output_stream.active:
+        print("Audio playback stream is already active.")
+        return
+
+    try:
+        # Clear the buffer before starting a new stream
+        while not audio_output_buffer.empty():
+            audio_output_buffer.get_nowait()
+            audio_output_buffer.task_done()
+        print("Audio output buffer cleared before starting playback stream.")
+
+        # Query device for its default samplerate if using a specific device, 
+        # otherwise use PLAYBACK_SAMPLERATE (e.g. 48000)
+        # For simplicity, we'll use a fixed PLAYBACK_SAMPLERATE. 
+        # The server should ideally send audio in a consistent format, or transcode.
+        # If server sends variable samplerates, client needs to resample or reinitialize stream.
+        
+        # Blocksize for output can also be chosen, e.g., matching input or a fixed duration
+        # Using sd.default.blocksize or a fixed value like int(PLAYBACK_SAMPLERATE * 0.02) (20ms)
+        # If None, sounddevice will choose.
+
+        audio_output_stream = sd.OutputStream(
+            device=actual_output_device_id,
+            samplerate=PLAYBACK_SAMPLERATE, # Fixed playback sample rate
+            channels=1, # Mono playback
+            callback=_audio_playback_callback,
+            blocksize=0 # Let sounddevice choose, or set (e.g., int(PLAYBACK_SAMPLERATE * 0.02))
+        )
+        audio_output_stream.start()
+        is_audio_playback_active = True
+        print(f"Audio playback stream started on device {actual_output_device_id} with samplerate {PLAYBACK_SAMPLERATE} and blocksize {audio_output_stream.blocksize}.")
+    except Exception as e:
+        is_audio_playback_active = False
+        print(f"Error starting audio playback stream: {e}")
+        if hasattr(page_ref, 'overlay'):
+            sb = ft.SnackBar(ft.Text(f"Audio Playback Error: {str(e)[:50]}...", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.RED_ACCENT_700, open=True)
+            page_ref.overlay.append(sb)
+            if hasattr(page_ref, 'update'): page_ref.update()
+
+async def _stop_audio_playback_stream_if_running():
+    """Helper function to stop the audio playback stream if it's running."""
+    global audio_output_stream, is_audio_playback_active
+
+    if is_audio_playback_active and audio_output_stream:
+        print("Stopping audio playback stream...")
+        try:
+            if audio_output_stream.active:
+                audio_output_stream.stop()
+            audio_output_stream.close()
+            print("Audio playback stream stopped and closed.")
+        except Exception as e:
+            print(f"Error stopping/closing audio playback stream: {e}")
+        finally:
+            audio_output_stream = None
+            is_audio_playback_active = False
+            # Clear the buffer on stop
+            while not audio_output_buffer.empty():
+                try:
+                    audio_output_buffer.get_nowait()
+                    audio_output_buffer.task_done()
+                except asyncio.QueueEmpty:
+                    break # Should not happen if not empty check is reliable
+            print("Audio output buffer cleared after stopping playback stream.")
+    else:
+        is_audio_playback_active = False # Ensure flag is reset
+        print("Audio playback stream was not running or already stopped.")
+
 # --- Main Application Logic ---
 async def main(page: ft.Page):
     page.title = "Voice/Text Chat Client"
@@ -475,6 +624,39 @@ async def main(page: ft.Page):
         if is_actively_in_voice_channel and target_channel_id == current_voice_channel_id and user_id in current_voice_channel_active_users:
             current_voice_channel_active_users[user_id]['speaking'] = is_speaking_status
             update_voice_channel_user_list_ui()
+    
+    @sio_client.event
+    async def voice_data_stream_chunk(data):
+        """Handles incoming audio data chunks from other users."""
+        global audio_output_buffer, is_audio_playback_active, current_user_info, page, selected_output_device_id
+
+        if not is_audio_playback_active and is_actively_in_voice_channel:
+            # If we are in a voice channel but playback isn't active, try to start it.
+            # This might happen if it failed to start initially or was stopped due to an error.
+            print("Audio playback is not active while in a voice channel. Attempting to start playback stream.")
+            # Use selected_output_device_id, which _start_audio_playback_stream can use or fallback to default
+            await _start_audio_playback_stream(page, selected_output_device_id) 
+
+        if not is_audio_playback_active: # Check again, if start failed, don't process
+            # print("Still no active playback stream after attempting to start. Discarding audio chunk.")
+            return
+        
+        sender_user_id = data.get('user_id')
+        # Crucial: Do not play back our own audio if server somehow sends it back
+        if current_user_info and sender_user_id == current_user_info.get('id'):
+            return
+
+        audio_chunk_list = data.get('audio_data')
+        if audio_chunk_list and isinstance(audio_chunk_list, list):
+            try:
+                # Convert list of floats to NumPy array
+                audio_np_array = np.array(audio_chunk_list, dtype=np.float32)
+                await audio_output_buffer.put(audio_np_array)
+                # print(f"Received audio chunk from user {sender_user_id}, size: {len(audio_np_array)}, buffer size: {audio_output_buffer.qsize()}") # Debug
+            except Exception as e:
+                print(f"Error processing or queuing audio chunk: {e}")
+        # else:
+            # print(f"Received voice_data_stream_chunk with invalid audio_data from user {sender_user_id}")
     
     @sio_client.event
     async def error(data):
@@ -673,12 +855,31 @@ async def main(page: ft.Page):
             if hasattr(page, 'overlay'): page.overlay.append(sb); page.update()
 
     async def handle_output_device_change(e):
-        global selected_output_device_id, is_mic_testing
-        selected_output_device_id = int(e.control.value) if e.control.value and e.control.value != "-1" else None
-        print(f"Selected Output Device ID: {selected_output_device_id}")
-        if is_mic_testing: 
-            await handle_mic_test_button_click(None)
-        if hasattr(page, 'update'): page.update()
+        global selected_output_device_id, is_mic_testing, is_audio_playback_active, page
+        new_output_device_id = int(e.control.value) if e.control.value and e.control.value != "-1" else None
+        
+        if selected_output_device_id != new_output_device_id:
+            selected_output_device_id = new_output_device_id
+            print(f"Selected Output Device ID: {selected_output_device_id}")
+
+            if is_mic_testing: # If mic test is running, stop and restart it to use new output for loopback
+                print("Output device changed during mic test. Restarting test.")
+                await handle_mic_test_button_click(None) # Stop current test
+                # User will need to manually start it again if they wish, as it might be disruptive.
+                # Or, we could try to restart it automatically:
+                # await handle_mic_test_button_click(None) # Start new test
+            
+            # If audio playback is active, restart it with the new device
+            if is_audio_playback_active:
+                print("Output device changed while audio playback is active. Restarting playback stream.")
+                await _stop_audio_playback_stream_if_running()
+                if selected_output_device_id is not None: # only restart if a valid device is selected
+                    await _start_audio_playback_stream(page, selected_output_device_id)
+                else:
+                    print("No output device selected. Audio playback stopped.")
+                    sb = ft.SnackBar(ft.Text("Output device unselected. Audio playback stopped.", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.ORANGE_ACCENT_700, open=True)
+                    if hasattr(page, 'overlay'): page.overlay.append(sb); page.update()
+        # else: print("Output device selection did not change.")
 
     async def handle_mute_mic_click(e): 
         global is_mic_muted, current_voice_channel_id, sio_client
@@ -867,6 +1068,7 @@ async def main(page: ft.Page):
         # Stop audio streaming if it was active
         if was_actively_in_voice:
             await _stop_audio_stream_if_running()
+            await _stop_audio_playback_stream_if_running() # Stop playback when leaving active voice
 
         is_actively_in_voice_channel = False
         current_voice_channel_id = None # Always reset this when leaving active state
@@ -1051,7 +1253,7 @@ async def main(page: ft.Page):
 
 
     async def handle_confirm_join_voice_button_click(page_ref: ft.Page):
-        global is_actively_in_voice_channel, current_voice_channel_id, previewing_voice_channel_id, selected_input_device_id
+        global is_actively_in_voice_channel, current_voice_channel_id, previewing_voice_channel_id, selected_input_device_id, selected_output_device_id
         
         if previewing_voice_channel_id is None:
             print("Error: Confirm join clicked but no channel is being previewed.")
@@ -1078,13 +1280,17 @@ async def main(page: ft.Page):
             except Exception as e:
                 print(f"Error emitting join_voice_channel on confirm: {e}")
         
-        # Start audio streaming
+        # Start audio streaming (input)
         if selected_input_device_id is not None:
             await _start_audio_stream(page_ref, selected_input_device_id)
         else:
             print("No input device selected. Cannot start audio stream.")
             sb = ft.SnackBar(ft.Text("Please select an input device in settings to send voice.", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.ORANGE_ACCENT_700, open=True)
             if hasattr(page_ref, 'overlay'): page_ref.overlay.append(sb); page_ref.update()
+
+        # Start audio playback (output)
+        # _start_audio_playback_stream will use selected_output_device_id or fallback to default
+        await _start_audio_playback_stream(page_ref, selected_output_device_id)
 
         update_voice_channel_user_list_ui() # Update UI elements (buttons, topic prefix)
         if hasattr(page_ref, 'update'): page_ref.update()
@@ -1443,6 +1649,7 @@ async def main(page: ft.Page):
         if original_on_close: await original_on_close(e) if inspect.iscoroutinefunction(original_on_close) else original_on_close(e)
         await _leave_current_voice_channel_if_any(page, called_from_select_new_voice=False) # Ensure we leave voice on app close
         await _stop_audio_stream_if_running() # Ensure audio stream is stopped
+        await _stop_audio_playback_stream_if_running() # Ensure audio playback is stopped
         if sio_client and sio_client.connected: await sio_client.disconnect()
         if shared_aiohttp_session and not shared_aiohttp_session.closed: await shared_aiohttp_session.close()
     page.on_close = on_close_extended
