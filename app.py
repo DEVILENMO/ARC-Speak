@@ -560,7 +560,7 @@ def handle_voice_data_stream(data):
     # 2. Forward the actual audio data chunk to others in the room
     emit('voice_data_stream_chunk', 
          {'channel_id': channel_id, 'user_id': user_id, 'username': username, 'audio_data': audio_data}, 
-         room=room_name, 
+             room=room_name, 
          skip_sid=request.sid) # Still skip SID for the audio data itself to avoid self-playback of raw audio
 
 # WebSocket: WebRTC信令

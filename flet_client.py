@@ -475,7 +475,8 @@ async def _stop_audio_playback_stream_if_running():
 
 # --- Main Application Logic ---
 async def main(page: ft.Page):
-    page.title = "Voice/Text Chat Client"
+    page.title = "ARC SPEAK"
+    page.window_icon = "assests/icon.png" # Add this line to set the window icon
     page.padding = 0
     page.bgcolor = COLOR_BACKGROUND_WHITE # Global page background
     page.theme_mode = ft.ThemeMode.LIGHT # Explicitly set to light
@@ -1633,9 +1634,121 @@ async def main(page: ft.Page):
                 if register_button: register_button.disabled = False; register_button.update()
             if hasattr(page, 'update'): page.update()
 
-    async def show_register_view(e): # Simplified
-        if active_page_controls.get('status_text'): active_page_controls['status_text'].value = "Reg not implemented."
+    # --- Registration UI Elements (defined globally within main's scope for access) ---
+    reg_username_field = ft.TextField(label="Username", width=300, autofocus=True,
+                                     border_color=COLOR_BORDER, focused_border_color=COLOR_PRIMARY_PURPLE,
+                                     label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE),
+                                     text_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE))
+    reg_password_field = ft.TextField(label="Password", password=True, can_reveal_password=True, width=300,
+                                     border_color=COLOR_BORDER, focused_border_color=COLOR_PRIMARY_PURPLE,
+                                     label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE),
+                                     text_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE))
+    reg_confirm_password_field = ft.TextField(label="Confirm Password", password=True, can_reveal_password=True, width=300,
+                                             border_color=COLOR_BORDER, focused_border_color=COLOR_PRIMARY_PURPLE,
+                                             label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE),
+                                             text_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE))
+    reg_invite_code_field = ft.TextField(label="Invite Code", width=300,
+                                        border_color=COLOR_BORDER, focused_border_color=COLOR_PRIMARY_PURPLE,
+                                        label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE),
+                                        text_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE))
+    register_page_status_text = ft.Text(color=COLOR_STATUS_TEXT_MUTED, text_align=ft.TextAlign.CENTER) # For register page specific messages
 
+    async def attempt_register(e):
+        global page # Ensure page is accessible
+        username = reg_username_field.value.strip()
+        password = reg_password_field.value
+        confirm_password = reg_confirm_password_field.value
+        invite_code = reg_invite_code_field.value.strip()
+
+        if not username or not password or not confirm_password or not invite_code:
+            register_page_status_text.value = "All fields are required."
+            if hasattr(page, 'update'): page.update()
+            return
+
+        if password != confirm_password:
+            register_page_status_text.value = "Passwords do not match."
+            if hasattr(page, 'update'): page.update()
+            return
+
+        register_page_status_text.value = "Registering..."
+        if actual_register_button: actual_register_button.disabled = True
+        if back_to_login_button: back_to_login_button.disabled = True
+        if hasattr(page, 'update'): 
+            if actual_register_button: actual_register_button.update()
+            if back_to_login_button: back_to_login_button.update()
+            page.update()
+
+        register_payload = {
+            "username": username,
+            "password": password,
+            "invite_code": invite_code
+        }
+        data_response = {}
+        try:
+            async with shared_aiohttp_session.post(f"{API_BASE_URL}/register", json=register_payload) as response:
+                data_response = await response.json()
+                if response.status == 201 and data_response.get("success"):
+                    register_page_status_text.value = "Registration successful! Please login."
+                    reg_username_field.value = ""
+                    reg_password_field.value = ""
+                    reg_confirm_password_field.value = ""
+                    reg_invite_code_field.value = ""
+                    # show_login_view(page) # Redirect to login after success
+                else:
+                    msg = data_response.get('message', f'Error {response.status}') if isinstance(data_response, dict) else await response.text()
+                    register_page_status_text.value = f"Registration failed: {msg}"
+        except Exception as ex:
+            register_page_status_text.value = f"Registration error: {str(ex)}"
+        finally:
+            if actual_register_button: actual_register_button.disabled = False
+            if back_to_login_button: back_to_login_button.disabled = False
+            if hasattr(page, 'update'): 
+                if actual_register_button: actual_register_button.update()
+                if back_to_login_button: back_to_login_button.update()
+                page.update()
+
+    actual_register_button = ft.ElevatedButton(
+        text="Register",
+        on_click=attempt_register, 
+        width=150,
+        bgcolor=COLOR_PRIMARY_PURPLE, color=COLOR_BUTTON_TEXT
+    )
+    back_to_login_button = ft.ElevatedButton(
+        text="Back to Login",
+        on_click=lambda e: show_login_view(page), 
+        width=150,
+        bgcolor=ft.Colors.with_opacity(0.7, COLOR_PRIMARY_PURPLE), color=COLOR_BUTTON_TEXT # Slightly different style for secondary
+    )
+
+    active_page_controls['register_view'] = ft.Column([
+        ft.Text("Create Account", size=24, weight=ft.FontWeight.BOLD, color=COLOR_TEXT_ON_WHITE),
+        reg_username_field,
+        reg_password_field,
+        reg_confirm_password_field,
+        reg_invite_code_field,
+        ft.Row([actual_register_button, back_to_login_button], alignment=ft.MainAxisAlignment.CENTER, spacing=10),
+        register_page_status_text
+    ], alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=15, expand=True, visible=False)
+
+    async def show_register_view(e): 
+        active_page_controls['login'].visible = False
+        active_page_controls['register_view'].visible = True
+        active_page_controls['main_app'].visible = False # Ensure main app is hidden too
+        
+        if active_page_controls.get('status_text'): # Clear login status text
+            active_page_controls['status_text'].value = ""
+            active_page_controls['status_text'].update()
+        
+        register_page_status_text.value = "" # Clear previous registration status
+        reg_username_field.value = "" 
+        reg_password_field.value = ""
+        reg_confirm_password_field.value = ""
+        reg_invite_code_field.value = "" 
+        if actual_register_button: actual_register_button.disabled = False
+        if back_to_login_button: back_to_login_button.disabled = False
+
+        if hasattr(page, 'update'): page.update()
+    
     username_field = ft.TextField(label="Username", width=300, autofocus=True, value=app_config.get("username", ""),
                                   border_color=COLOR_BORDER, focused_border_color=COLOR_PRIMARY_PURPLE,
                                   label_style=ft.TextStyle(color=COLOR_TEXT_ON_WHITE),
@@ -1850,7 +1963,18 @@ async def main(page: ft.Page):
     
     def show_login_view(p: ft.Page):
         active_page_controls['main_app'].visible = False
+        active_page_controls['register_view'].visible = False 
         active_page_controls['login'].visible = True
+        
+        # Clear registration status text if any parts of it are visible or have values
+        register_page_status_text.value = ""
+        reg_username_field.value = "" # Clear fields when going back to login
+        reg_password_field.value = ""
+        reg_confirm_password_field.value = ""
+        reg_invite_code_field.value = ""
+        if login_button: login_button.disabled = False
+        if register_button: register_button.disabled = False # The one on the login page
+
         global current_voice_channel_id, current_text_channel_id, previewing_voice_channel_id, is_actively_in_voice_channel, current_voice_channel_active_users, current_chat_messages, all_server_users
         if sio_client and sio_client.connected: p.run_task(sio_client.disconnect) 
         current_voice_channel_id, current_text_channel_id, previewing_voice_channel_id = None, None, None
@@ -1881,7 +2005,36 @@ async def main(page: ft.Page):
             await sio_client.emit('send_message', {'channel_id': current_text_channel_id, 'message': msg_content})
             active_page_controls['message_input_field'].value = ""; active_page_controls['message_input_field'].update()
 
-    page.add(active_page_controls['login'], main_app_view_content)
+    # Page setup: Add all top-level views (login, register, main_app)
+    # Only one will be visible at a time.
+    # Ensure 'register_view' is added to the page controls if not already
+    if 'register_view' not in page.controls:
+        page.add(active_page_controls['register_view'])
+
+    # Original page.add for login and main_app_view_content should be here or adjusted
+    # Assuming login and main_app_view_content are already handled by an existing page.add() call.
+    # If page.add was just page.add(login_view, main_app_view), it needs to include register_view now.
+    # Let's find the original page.add and modify it if it exists, or add all three if it doesn't.
+
+    #Revised page.add structure:
+    # Remove existing page.add if it only adds login and main_app views separately.
+    # Ensure all three top-level views are added once. Order for .add doesn't strictly matter for visibility management.
+    # First remove all controls to be safe if we are re-adding them. This avoids duplicates if this part of code is hit multiple times. (Defensive)
+    # page.controls.clear() # Potentially too aggressive if other things are added elsewhere. Let's assume this is the main setup. 
+    
+    # Check if controls are already added to avoid duplication if this logic runs multiple times
+    # This is a common pattern in Flet if main can be re-evaluated or for hot reload scenarios
+    # However, for initial setup, page.add is usually called once with all primary layouts.
+
+    # Simplified: Assuming this is the primary setup point for these views.
+    # The previous page.add(active_page_controls['login'], main_app_view_content) will be replaced by this:
+    page.controls.clear() # Clear any previous controls if we are redefining the page structure here.
+    page.add(
+        active_page_controls['login'], 
+        active_page_controls['register_view'], 
+        main_app_view_content
+    )
+    
     original_on_close = page.on_close if hasattr(page, 'on_close') else None
     async def on_close_extended(e):
         if original_on_close: await original_on_close(e) if inspect.iscoroutinefunction(original_on_close) else original_on_close(e)
