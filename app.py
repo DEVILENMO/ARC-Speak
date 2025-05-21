@@ -421,11 +421,47 @@ def handle_user_speaking_status(data):
 
     if channel_id is not None and speaking is not None and user_id is not None:
         room_name = f"voice_channel_{channel_id}"
-        # print(f"User {user_id} speaking status {speaking} in room {room_name}") # For debugging
+        print(f"[SPEAKING_STATUS] User {user_id} speaking: {speaking} in channel {channel_id} (room: {room_name})") # DEBUG
         emit('user_speaking',
              {'channel_id': channel_id, 'user_id': user_id, 'speaking': speaking}, 
              room=room_name, 
              skip_sid=request.sid) # skip_sid 确保事件不会发回给原始发送者
+
+# WebSocket: 接收并转发语音数据流
+@socketio.on('voice_data_stream')
+def handle_voice_data_stream(data):
+    print(f"[VOICE_DATA_STREAM] Event received. SID: {request.sid}, User: {current_user.username if current_user.is_authenticated else 'N/A'}. Data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}") # Initial event reception log
+    if not current_user.is_authenticated:
+        print("[VOICE_DATA_STREAM] Received voice data from unauthenticated user.")
+        return
+
+    channel_id = data.get('channel_id')
+    audio_data = data.get('audio_data') # 客户端发送的原始PCM数据列表
+    user_id = current_user.id
+    username = current_user.username
+
+    if channel_id is None or audio_data is None:
+        print(f"[VOICE_DATA_STREAM] Missing channel_id or audio_data from user {user_id}. Channel: {channel_id}, Data type: {type(audio_data)}")
+        emit('error', {'message': 'Voice data stream missing channel_id or audio_data.'}, room=request.sid)
+        return
+
+    # 检查用户是否确实在目标语音频道 (可选, 但推荐)
+    session = VoiceSession.query.filter_by(user_id=user_id, channel_id=channel_id).first()
+    if not session:
+        print(f"[VOICE_DATA_STREAM] User {user_id} ({username}) attempting to send voice data to channel {channel_id} they are not in (or session missing).")
+        # emit('error', {'message': 'You are not in this voice channel.'}, room=request.sid) # Potentially noisy
+        return 
+
+    room_name = f"voice_channel_{channel_id}"
+    print(f"[VOICE_DATA_STREAM] User {user_id} ({username}) sent voice data to channel {channel_id} (room: {room_name}). Data length: {len(audio_data) if isinstance(audio_data, list) else 'N/A'}") # DEBUG
+    
+    # 将音频数据和发送者信息广播给房间内的其他用户
+    emit('voice_data_stream_chunk', {
+        'channel_id': channel_id,
+        'user_id': user_id,
+        'username': username, # 发送用户名可能对客户端有帮助
+        'audio_data': audio_data
+    }, room=room_name, skip_sid=request.sid)
 
 # WebSocket: WebRTC信令
 @socketio.on('voice_signal')

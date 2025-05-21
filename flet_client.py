@@ -59,6 +59,12 @@ mic_test_thread: threading.Thread = None
 mic_test_stop_event = threading.Event()
 mic_test_ui_update_task: asyncio.Task = None
 
+# --- Audio Streaming Globals ---
+is_sending_audio = False
+audio_stream_thread: threading.Thread = None
+audio_stream_stop_event = threading.Event()
+AUDIO_RMS_THRESHOLD = 0.02 # Tune this threshold for VAD (e.g. 0.01 to 0.1)
+
 text_channels_data = {} 
 voice_channels_data = {} 
 current_chat_messages = [] 
@@ -163,6 +169,141 @@ def _run_mic_test_loop(page_instance: ft.Page, input_dev_id: int, output_dev_id:
             current_mic_test_volume = 0.0 # Reset volume on stop
         print("Mic test loop finished.")
 
+# --- Audio Streaming Functions (Voice Chat) ---
+def _audio_stream_callback(indata, frames, time, status):
+    """Callback for the main audio input stream."""
+    global is_mic_muted, current_voice_channel_id, sio_client, AUDIO_RMS_THRESHOLD, page, is_sending_audio
+
+    if status:
+        # Log significant statuses, but be mindful of log spam
+        if status.input_overflow or status.input_underflow or status.output_overflow or status.output_underflow:
+            print(f"Audio Stream Callback Status Warning: {status}")
+
+    if not is_sending_audio or not is_actively_in_voice_channel or current_voice_channel_id is None or not sio_client or not sio_client.connected or not page or not page.loop:
+        return
+
+    if is_mic_muted:
+        # If muted, ensure server knows we are not speaking.
+        # This might be redundant if user_speaking_status is regularly sent,
+        # but good for ensuring state consistency on mute toggle.
+        try:
+            asyncio.run_coroutine_threadsafe(
+                sio_client.emit('user_speaking_status', {
+                    'channel_id': current_voice_channel_id,
+                    'speaking': False
+                }),
+                page.loop
+            )
+        except Exception as e:
+            print(f"Error emitting speaking status (muted) from audio callback: {e}")
+        return
+
+    # VAD: Calculate RMS of the input data
+    # indata is a NumPy array. Assuming mono, so indata.shape might be (n_frames, 1) or (n_frames,)
+    rms = np.linalg.norm(indata) / np.sqrt(len(indata.flat)) # Use .flat for robust length calculation
+    is_currently_speaking = rms > AUDIO_RMS_THRESHOLD
+
+    # Emit speaking status
+    try:
+        asyncio.run_coroutine_threadsafe(
+            sio_client.emit('user_speaking_status', {
+                'channel_id': current_voice_channel_id,
+                'speaking': is_currently_speaking
+            }),
+            page.loop
+        )
+    except Exception as e:
+        print(f"Error emitting speaking status from audio callback: {e}")
+
+    if is_currently_speaking:
+        # Send audio data (raw PCM as list of floats for now)
+        # Assuming mono, take the first channel or flatten if already mono
+        audio_data_list = indata[:, 0].tolist() if indata.ndim > 1 else indata.tolist()
+        try:
+            asyncio.run_coroutine_threadsafe(
+                sio_client.emit('voice_data_stream', {
+                    'channel_id': current_voice_channel_id,
+                    'audio_data': audio_data_list
+                }),
+                page.loop
+            )
+        except Exception as e:
+            print(f"Error emitting voice data stream from audio callback: {e}")
+
+def _run_audio_stream_loop(input_dev_id: int, stop_event: threading.Event, page_instance_ref: ft.Page):
+    """Runs the audio capture and transmission loop in a separate thread."""
+    global is_sending_audio, sio_client, current_voice_channel_id # page_instance_ref is 'page'
+    stream = None
+    try:
+        if not SOUNDDEVICE_AVAILABLE or sd is None:
+            print("Sounddevice not available for audio streaming.")
+            # Optionally notify UI, but this check should ideally happen before starting the thread
+            return
+
+        samplerate = sd.query_devices(input_dev_id, 'input')['default_samplerate']
+        
+        # For InputStream, callback should not block for long.
+        # blocksize=0 lets sounddevice choose an optimal size.
+        # A common blocksize for voice is around 20ms of audio data.
+        # e.g., for 48000 Hz, 20ms is 960 frames. sd.default.blocksize might be a good start.
+        # Using a smaller blocksize (e.g. 480 frames for 10ms @ 48kHz) can reduce latency for VAD and transmission.
+        stream = sd.InputStream(
+            device=input_dev_id,
+            samplerate=samplerate,
+            channels=1, # Mono for simplicity
+            callback=_audio_stream_callback,
+            blocksize=int(samplerate * 0.02) # Approx 20ms blocks, adjust as needed
+        )
+        stream.start()
+        print(f"Audio stream started for input device {input_dev_id} with samplerate {samplerate} and blocksize {stream.blocksize}.")
+        # is_sending_audio = True # Set by the caller before starting the thread usually
+
+        while not stop_event.is_set():
+            if not is_sending_audio: # Additional check in case flag is set externally
+                print("is_sending_audio became false, stopping stream loop.")
+                break
+            sd.sleep(100) # Keep thread alive; callback does the work. Check stop event periodically.
+        
+        print("Audio stream stop event received or is_sending_audio is false.")
+
+    except Exception as e:
+        print(f"Error in audio stream loop: {e}")
+        error_message = f"Audio Stream Error: {str(e)[:100]}..."
+        if page_instance_ref and page_instance_ref.loop and hasattr(page_instance_ref, 'overlay') and hasattr(page_instance_ref, 'update'):
+            async def show_error_async():
+                sb = ft.SnackBar(ft.Text(error_message, color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.RED_ACCENT_700, open=True)
+                page_instance_ref.overlay.append(sb)
+                page_instance_ref.update()
+            asyncio.run_coroutine_threadsafe(show_error_async(), page_instance_ref.loop)
+    finally:
+        if stream:
+            try:
+                if stream.active: # Check if stream is active before stopping
+                    stream.stop()
+                stream.close()
+                print("Audio stream stopped and closed.")
+            except Exception as e:
+                print(f"Error stopping/closing audio stream: {e}")
+        
+        # Ensure is_sending_audio is false when loop exits
+        # is_sending_audio = False # Caller should manage this more directly usually
+
+        # Send a final "not speaking" status if client was connected and in a channel
+        if sio_client and sio_client.connected and current_voice_channel_id is not None and \
+           page_instance_ref and page_instance_ref.loop and is_actively_in_voice_channel : # Check if still active
+            try:
+                print("Sending final 'not speaking' status from audio loop finally block.")
+                asyncio.run_coroutine_threadsafe(
+                    sio_client.emit('user_speaking_status', {
+                        'channel_id': current_voice_channel_id,
+                        'speaking': False
+                    }),
+                    page_instance_ref.loop
+                )
+            except Exception as e:
+                print(f"Error sending final speaking status: {e}")
+        print("Audio stream loop finished.")
+
 # --- Main Application Logic ---
 async def main(page: ft.Page):
     page.title = "Voice/Text Chat Client"
@@ -223,14 +364,43 @@ async def main(page: ft.Page):
         vc_user_controls = []
         # current_voice_channel_active_users should hold users for previewing_voice_channel_id
         sorted_users_in_vc = sorted(current_voice_channel_active_users.values(), key=lambda u: u.get('username', '').lower())
+        
         for user_data in sorted_users_in_vc:
-            is_speaking_active = is_actively_in_voice_channel and user_data.get('speaking', False)
-            speaking_indicator = ft.Icon(
-                name=ft.Icons.RECORD_VOICE_OVER if is_speaking_active else ft.Icons.VOICE_OVER_OFF,
-                color=ft.Colors.GREEN_ACCENT_700 if is_speaking_active else COLOR_STATUS_TEXT_MUTED, # Keep green for speaking, muted for off
-                size=16
+            is_user_actually_speaking = is_actively_in_voice_channel and user_data.get('speaking', False)
+
+            if is_user_actually_speaking:
+                user_card_text_color = COLOR_TEXT_ON_PURPLE # Should be ft.Colors.WHITE
+                user_card_icon_color = COLOR_ICON_ON_PURPLE   # Should be ft.Colors.WHITE
+                user_card_icon_name = ft.Icons.RECORD_VOICE_OVER
+                user_card_bgcolor = COLOR_PRIMARY_PURPLE
+                user_card_border = None 
+            else:
+                user_card_text_color = COLOR_TEXT_ON_WHITE # Should be COLOR_TEXT_DARK_PURPLE
+                user_card_icon_color = COLOR_ICON_ON_WHITE   # Should be COLOR_TEXT_DARK_PURPLE
+                user_card_icon_name = ft.Icons.VOICE_OVER_OFF
+                user_card_bgcolor = COLOR_BACKGROUND_WHITE 
+                user_card_border = ft.border.all(1, COLOR_DIVIDER_ON_WHITE) # Grey outline
+
+            user_display_row = ft.Row(
+                [
+                    ft.Icon(name=user_card_icon_name, color=user_card_icon_color, size=16),
+                    ft.Text(user_data.get('username', 'Unknown'), color=user_card_text_color, weight=ft.FontWeight.NORMAL, size=12)
+                ],
+                alignment=ft.MainAxisAlignment.START,
+                spacing=5,
+                # vertical_alignment=ft.CrossAxisAlignment.CENTER # Ensure elements within the row are centered vertically
             )
-            vc_user_controls.append(ft.Row([speaking_indicator, ft.Text(user_data.get('username', 'Unknown'), color=COLOR_TEXT_ON_WHITE)], alignment=ft.MainAxisAlignment.START, spacing=5))
+
+            user_card = ft.Container(
+                content=user_display_row,
+                bgcolor=user_card_bgcolor,
+                border=user_card_border,
+                border_radius=ft.border_radius.all(4), # Slightly rounded corners
+                padding=ft.padding.symmetric(vertical=4, horizontal=6), # Adjusted padding
+                margin=ft.margin.only(bottom=4) # Space between user cards
+            )
+            vc_user_controls.append(user_card)
+
         vc_users_list_ctrl.controls = vc_user_controls
         if hasattr(vc_users_list_ctrl, 'update'): vc_users_list_ctrl.update()
 
@@ -489,7 +659,18 @@ async def main(page: ft.Page):
         selected_input_device_id = int(e.control.value) if e.control.value and e.control.value != "-1" else None
         print(f"Selected Input Device ID: {selected_input_device_id}")
         if is_mic_testing: 
-            await handle_mic_test_button_click(None) 
+            await handle_mic_test_button_click(None) # Stop current test if ongoing
+        # If actively in a voice channel and sending audio, restart audio stream with new device
+        if is_actively_in_voice_channel and is_sending_audio and selected_input_device_id is not None:
+            print("Input device changed while in voice. Restarting audio stream.")
+            await _stop_audio_stream_if_running() # Stop existing stream
+            await _start_audio_stream(page, selected_input_device_id) # Start new one
+        elif is_actively_in_voice_channel and is_sending_audio and selected_input_device_id is None:
+            print("Input device unselected while in voice. Stopping audio stream.")
+            await _stop_audio_stream_if_running()
+            # Optionally show a message that input device is required
+            sb = ft.SnackBar(ft.Text("Input device unselected. Voice transmission stopped.", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.ORANGE_ACCENT_700, open=True)
+            if hasattr(page, 'overlay'): page.overlay.append(sb); page.update()
 
     async def handle_output_device_change(e):
         global selected_output_device_id, is_mic_testing
@@ -497,6 +678,7 @@ async def main(page: ft.Page):
         print(f"Selected Output Device ID: {selected_output_device_id}")
         if is_mic_testing: 
             await handle_mic_test_button_click(None)
+        if hasattr(page, 'update'): page.update()
 
     async def handle_mute_mic_click(e): 
         global is_mic_muted, current_voice_channel_id, sio_client
@@ -605,6 +787,54 @@ async def main(page: ft.Page):
         if hasattr(mic_test_bar, 'update'): mic_test_bar.update() 
         # page.update() # May not be strictly needed if individual controls update
 
+    async def _start_audio_stream(page_ref: ft.Page, input_device_id: int):
+        """Helper function to start the audio stream."""
+        global is_sending_audio, audio_stream_thread, audio_stream_stop_event
+
+        if not SOUNDDEVICE_AVAILABLE or sd is None:
+            print("Cannot start audio stream: Sounddevice not available.")
+            sb = ft.SnackBar(ft.Text("Audio system not available. Cannot send voice.", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.RED_ACCENT_700, open=True)
+            if hasattr(page_ref, 'overlay'): page_ref.overlay.append(sb); page_ref.update()
+            return
+
+        if input_device_id is None:
+            print("Cannot start audio stream: No input device selected.")
+            sb = ft.SnackBar(ft.Text("No input device selected for voice.", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.RED_ACCENT_700, open=True)
+            if hasattr(page_ref, 'overlay'): page_ref.overlay.append(sb); page_ref.update()
+            return
+
+        if is_sending_audio and audio_stream_thread and audio_stream_thread.is_alive():
+            print("Audio stream already running. Not starting another.")
+            return
+
+        is_sending_audio = True
+        audio_stream_stop_event.clear()
+        audio_stream_thread = threading.Thread(
+            target=_run_audio_stream_loop,
+            args=(input_device_id, audio_stream_stop_event, page_ref)
+        )
+        audio_stream_thread.daemon = True
+        audio_stream_thread.start()
+        print(f"Audio streaming thread started for device ID: {input_device_id}")
+
+    async def _stop_audio_stream_if_running():
+        """Helper function to stop the audio stream if it's running."""
+        global is_sending_audio, audio_stream_thread, audio_stream_stop_event
+
+        if is_sending_audio and audio_stream_thread and audio_stream_thread.is_alive():
+            print("Stopping audio stream...")
+            is_sending_audio = False # Signal the loop to stop
+            audio_stream_stop_event.set() # Signal the thread to stop
+            await asyncio.to_thread(audio_stream_thread.join, timeout=1.0) # Wait for thread with timeout
+            if audio_stream_thread.is_alive():
+                print("Warning: Audio stream thread did not join in time.")
+            audio_stream_thread = None
+            print("Audio stream stopped.")
+        else:
+            # Ensure flag is reset even if thread was not alive or not an instance
+            is_sending_audio = False 
+            print("Audio stream was not running or already stopped.")
+
     active_page_controls['status_text'] = ft.Text(color=COLOR_STATUS_TEXT_MUTED) # Muted status text
     remember_me_checkbox = ft.Checkbox(label="记住我", value=app_config.get("remember_me", False),
                                         check_color=COLOR_PRIMARY_PURPLE,
@@ -634,6 +864,10 @@ async def main(page: ft.Page):
             except Exception as e:
                 print(f"Error emitting leave_voice_channel: {e}")
         
+        # Stop audio streaming if it was active
+        if was_actively_in_voice:
+            await _stop_audio_stream_if_running()
+
         is_actively_in_voice_channel = False
         current_voice_channel_id = None # Always reset this when leaving active state
         
@@ -817,7 +1051,7 @@ async def main(page: ft.Page):
 
 
     async def handle_confirm_join_voice_button_click(page_ref: ft.Page):
-        global is_actively_in_voice_channel, current_voice_channel_id, previewing_voice_channel_id
+        global is_actively_in_voice_channel, current_voice_channel_id, previewing_voice_channel_id, selected_input_device_id
         
         if previewing_voice_channel_id is None:
             print("Error: Confirm join clicked but no channel is being previewed.")
@@ -844,6 +1078,14 @@ async def main(page: ft.Page):
             except Exception as e:
                 print(f"Error emitting join_voice_channel on confirm: {e}")
         
+        # Start audio streaming
+        if selected_input_device_id is not None:
+            await _start_audio_stream(page_ref, selected_input_device_id)
+        else:
+            print("No input device selected. Cannot start audio stream.")
+            sb = ft.SnackBar(ft.Text("Please select an input device in settings to send voice.", color=COLOR_TEXT_ON_WHITE), bgcolor=ft.Colors.ORANGE_ACCENT_700, open=True)
+            if hasattr(page_ref, 'overlay'): page_ref.overlay.append(sb); page_ref.update()
+
         update_voice_channel_user_list_ui() # Update UI elements (buttons, topic prefix)
         if hasattr(page_ref, 'update'): page_ref.update()
         print(f"Successfully joined voice channel: {vc_name} (ID: {current_voice_channel_id})")
@@ -1199,7 +1441,8 @@ async def main(page: ft.Page):
     original_on_close = page.on_close if hasattr(page, 'on_close') else None
     async def on_close_extended(e):
         if original_on_close: await original_on_close(e) if inspect.iscoroutinefunction(original_on_close) else original_on_close(e)
-        await _leave_current_voice_channel_if_any(page, switch_to_text=False) # Ensure we leave voice on app close
+        await _leave_current_voice_channel_if_any(page, called_from_select_new_voice=False) # Ensure we leave voice on app close
+        await _stop_audio_stream_if_running() # Ensure audio stream is stopped
         if sio_client and sio_client.connected: await sio_client.disconnect()
         if shared_aiohttp_session and not shared_aiohttp_session.closed: await shared_aiohttp_session.close()
     page.on_close = on_close_extended
