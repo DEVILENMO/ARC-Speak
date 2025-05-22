@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assests/icon.png" alt="App Icon" width="150"/>
+  <img src="assets/icon.png" alt="App Icon" width="150"/>
 </p>
 
 # ARC SPEAK
@@ -60,9 +60,9 @@ Before running this project, ensure your system has the following software insta
 2.  **Create and Activate Conda Environment**:
     This project recommends using a Conda environment named `Flask`.
     *   Open your terminal or Anaconda Prompt.
-    *   Create a new Conda environment (if it doesn't already exist). Replace `python=3.x` with your desired Python version (e.g., `python=3.10`):
+    *   Create a new Conda environment (if it doesn't already exist). Replace `python=3.x` with your desired Python version (e.g., `python=3.13`):
         ```bash
-        conda create -n Flask python=3.10
+        conda create -n Flask python=3.13
         ```
     *   Activate the Conda environment:
         ```bash

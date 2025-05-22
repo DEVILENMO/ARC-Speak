@@ -1,5 +1,5 @@
  <p align="center">
-  <img src="assests/icon.png" alt="App Icon" width="150"/>
+  <img src="assets/icon.png" alt="App Icon" width="150"/>
 </p>
  
  # ARC SPEAK 弧光语音
@@ -58,9 +58,9 @@
 2.  **创建并激活 Conda 环境**:
     本项目推荐使用名为 `Flask` 的 Conda 环境。
     *   打开您的终端或 Anaconda Prompt。
-    *   创建一个新的 Conda 环境 (如果尚不存在)。将 `python=3.x`替换为您希望使用的 Python 版本 (例如 `python=3.10`)：
+    *   创建一个新的 Conda 环境 (如果尚不存在)。将 `python=3.x`替换为您希望使用的 Python 版本 (例如 `python=3.13`)：
         ```bash
-        conda create -n Flask python=3.10
+        conda create -n Flask python=3.13
         ```
     *   激活 Conda 环境:
         ```bash
