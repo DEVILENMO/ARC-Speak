@@ -43,19 +43,23 @@ This is a extremely light voice and text chat application built with Python, Fla
 
 Before running this project, ensure your system has the following software installed:
 
-1.  **Python**: Version 3.9 or higher (refer to Conda environment creation or `requirements.txt` for specific version compatibility used during development).
-2.  **Conda**: Anaconda or Miniconda for environment management.
-3.  **(Optional) Git**: For cloning the project repository (if the project is hosted in a version control system).
+1.  **Python**: Version 3.13 (This project is only guaranteed to work with Python 3.13).
+2.  **Conda**: Miniforge (recommended) or Anaconda for environment management.
+3.  **(Optional) Git**: For cloning the project repository.
 
 ## Installation and Setup
 
 1.  **Get Project Files**:
-    *   If the project is in a Git repository, clone the repository:
+    *   Clone the server repository:
         ```bash
-        git clone <repository_url>
-        cd <project_directory>
+        git clone https://github.com/DEVILENMO/ARC-Speak-Server.git
+        cd ARC-Speak-Server
         ```
-    *   Alternatively, download the project folder directly.
+    *   Clone the client repository (in a separate directory):
+        ```bash
+        git clone https://github.com/DEVILENMO/ARC-Speak-Client.git
+        cd ARC-Speak-Client
+        ```
 
 2.  **Create and Activate Conda Environment**:
     This project recommends using a Conda environment named `Flask`.
@@ -103,22 +107,17 @@ The project provides batch scripts (`.bat` files) to conveniently start the serv
 ## Project Structure (Overview)
 
 ```
-voicechat/
-├── icon.png                 # Application Icon
-├── .venv/                   # (Optional) Standard Python virtual environment (if not using Conda)
-├── cert.pem                 # SSL certificate file (self-generated)
-├── key.pem                  # SSL private key file (self-generated)
-├── app.py                   # Server-side Flask and SocketIO application logic
-├── flet_client.py           # Client-side Flet and SocketIO application logic
-├── models.py                # SQLAlchemy database model definitions
-├── requirements.txt         # Python package dependency list
-├── config.json              # (Client-side) Stores user configurations like remember me, device IDs
-├── voicechat.db             # (Server-side) SQLite database file
-├── run_server.bat           # Batch script to start the server
-├── run_client.bat           # Batch script to start the client
-├── README.md                # This project description file (English)
-├── README_zh.md             # Project description file (Chinese)
-└── ... (other possible static files or templates if the project expands)
+arc-speak-server/
+├── assets/                  # Static assets directory
+├── instance/               # Instance-specific files
+├── __pycache__/           # Python cache directory
+├── app.py                 # Server-side Flask and SocketIO application logic
+├── forms.py               # Form definitions for user authentication
+├── models.py              # SQLAlchemy database model definitions
+├── run_server.bat         # Batch script to start the server
+├── LICENSE                # GPL-3.0 license file
+├── README.md              # Project description file (English)
+└── README_zh.md           # Project description file (Chinese)
 ```
 
 ## Notes

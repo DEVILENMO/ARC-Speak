@@ -41,19 +41,23 @@
 
 在运行此项目之前，请确保您的系统已安装以下软件：
 
-1.  **Python**: 版本 3.9 或更高 (项目开发时使用的具体版本请参照 Conda 环境创建或 `requirements.txt` 中的兼容性)。
-2.  **Conda**: Anaconda 或 Miniconda 用于环境管理。
-3.  **(可选) Git**: 用于克隆项目仓库（如果项目托管在版本控制系统中）。
+1.  **Python**: 版本 3.13 (本项目仅保证在 Python 3.13 下正常工作)。
+2.  **Conda**: Miniforge (推荐) 或 Anaconda 用于环境管理。
+3.  **(可选) Git**: 用于克隆项目仓库。
 
 ## 安装与设置
 
 1.  **获取项目文件**:
-    *   如果项目在 Git 仓库中, 克隆仓库:
+    *   克隆服务端仓库:
         ```bash
-        git clone <repository_url>
-        cd <project_directory>
+        git clone https://github.com/DEVILENMO/ARC-Speak-Server.git
+        cd ARC-Speak-Server
         ```
-    *   或者，直接下载项目文件夹。
+    *   克隆客户端仓库 (在单独的目录中):
+        ```bash
+        git clone https://github.com/DEVILENMO/ARC-Speak-Client.git
+        cd ARC-Speak-Client
+        ```
 
 2.  **创建并激活 Conda 环境**:
     本项目推荐使用名为 `Flask` 的 Conda 环境。
@@ -101,20 +105,17 @@
 ## 项目结构 (概览)
 
 ```
-voicechat/
-├── .venv/                   # (可选) Python 标准虚拟环境 (如果未使用Conda)
-├── cert.pem                 # SSL 证书文件 (需自行生成)
-├── key.pem                  # SSL 私钥文件 (需自行生成)
-├── app.py                   # 服务端 Flask 和 SocketIO 应用逻辑
-├── flet_client.py           # 客户端 Flet 和 SocketIO 应用逻辑
-├── models.py                # SQLAlchemy 数据库模型定义
-├── requirements.txt         # Python 包依赖列表
-├── config.json              # (客户端) 存储用户配置，如记住我、设备ID
-├── voicechat.db             # (服务端) SQLite 数据库文件
-├── run_server.bat           # 启动服务端的批处理脚本
-├── run_client.bat           # 启动客户端的批处理脚本
-├── README.md                # 本项目说明文件
-└── ... (其他可能的静态文件或模板，如果项目扩展)
+arc-speak-server/
+├── assets/                  # 静态资源目录
+├── instance/               # 实例特定文件
+├── __pycache__/           # Python 缓存目录
+├── app.py                 # 服务端 Flask 和 SocketIO 应用逻辑
+├── forms.py               # 用户认证表单定义
+├── models.py              # SQLAlchemy 数据库模型定义
+├── run_server.bat         # 启动服务端的批处理脚本
+├── LICENSE                # GPL-3.0 许可证文件
+├── README.md              # 项目说明文件（英文）
+└── README_zh.md           # 项目说明文件（中文）
 ```
 
 ## 注意事项
