@@ -5,7 +5,9 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from models import db, User, Channel, Message, VoiceSession
 import os
 import numpy as np
+import time
 from datetime import datetime
+from collections import defaultdict, deque
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24)
@@ -16,133 +18,122 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 INITIAL_MESSAGE_LOAD_COUNT = 20
 OLDER_MESSAGE_LOAD_COUNT = 20
 
-# --- 音频处理配置常量 ---
-STANDARD_SAMPLERATE = 48000  # 统一使用48kHz采样率
+# --- 音频优化配置 ---
+STANDARD_SAMPLERATE = 48000  # 统一采样率
 STANDARD_CHANNELS = 1        # 单声道
-STANDARD_DTYPE = 'float32'   # 标准数据类型
-MAX_AUDIO_CHUNK_SIZE = 4800  # 最大音频块大小 (100ms @ 48kHz)
-MIN_AUDIO_CHUNK_SIZE = 480   # 最小音频块大小 (10ms @ 48kHz)
+AUDIO_CHUNK_SIZE = 960       # 20ms @ 48kHz
+MAX_AUDIO_BUFFER_SIZE = 5    # 每用户最大缓冲音频块数
+VOICE_ACTIVITY_TIMEOUT = 3.0 # 语音活动超时时间
 
-# --- 音频重采样支持 ---
-try:
-    import scipy.signal
-    SCIPY_AVAILABLE = True
-    print("Server: scipy available for high-quality audio resampling")
-except ImportError:
-    SCIPY_AVAILABLE = False
-    print("Server: scipy not available, using simple resampling")
+# 音频缓冲和带宽优化
+audio_buffers = defaultdict(lambda: deque(maxlen=MAX_AUDIO_BUFFER_SIZE))  # user_id: deque of audio chunks
+user_last_activity = defaultdict(float)  # user_id: last_activity_time
+active_speakers = defaultdict(set)  # channel_id: set of active user_ids
 
-def _resample_audio_server(audio_data, original_rate, target_rate):
-    """服务端音频重采样函数"""
-    if original_rate == target_rate:
-        return audio_data
-    
-    if not isinstance(audio_data, np.ndarray):
-        audio_data = np.array(audio_data, dtype=np.float32)
-    
-    if SCIPY_AVAILABLE:
-        # 使用scipy进行高质量重采样
-        num_samples = int(len(audio_data) * target_rate / original_rate)
-        return scipy.signal.resample(audio_data, num_samples).astype(np.float32)
-    else:
-        # 简单的线性插值重采样
-        ratio = target_rate / original_rate
-        new_length = int(len(audio_data) * ratio)
-        indices = np.linspace(0, len(audio_data) - 1, new_length)
-        return np.interp(indices, np.arange(len(audio_data)), audio_data).astype(np.float32)
-
-def _validate_and_process_audio(audio_data, metadata):
-    """验证和处理音频数据"""
-    was_resampled = False
-    was_normalized = False
-    was_enhanced = False
-    had_error = False
-    
+def optimize_audio_chunk(audio_data, original_samplerate=None):
+    """
+    优化音频数据块，减少带宽并确保质量
+    """
     try:
-        # 验证音频数据
-        if not isinstance(audio_data, list) or len(audio_data) == 0:
-            had_error = True
-            _update_audio_stats(0, had_error=had_error)
-            return None, "Invalid audio data format"
-        
-        original_length = len(audio_data)
-        
-        # 获取元数据
-        chunk_samplerate = metadata.get('samplerate', STANDARD_SAMPLERATE)
-        chunk_channels = metadata.get('channels', STANDARD_CHANNELS)
-        chunk_dtype = metadata.get('dtype', STANDARD_DTYPE)
-        
-        # 验证音频块大小
-        if len(audio_data) > MAX_AUDIO_CHUNK_SIZE:
-            print(f"[AUDIO_VALIDATION] Audio chunk too large: {len(audio_data)} samples, truncating to {MAX_AUDIO_CHUNK_SIZE}")
-            audio_data = audio_data[:MAX_AUDIO_CHUNK_SIZE]
-        elif len(audio_data) < MIN_AUDIO_CHUNK_SIZE:
-            print(f"[AUDIO_VALIDATION] Audio chunk too small: {len(audio_data)} samples, padding to {MIN_AUDIO_CHUNK_SIZE}")
-            # 填充零到最小大小
-            audio_data.extend([0.0] * (MIN_AUDIO_CHUNK_SIZE - len(audio_data)))
-        
+        if not audio_data or not isinstance(audio_data, (list, np.ndarray)):
+            return None
+            
         # 转换为numpy数组
         audio_np = np.array(audio_data, dtype=np.float32)
         
-        # 检查并修复音频数据范围
+        # 基本音频质量检查
+        if len(audio_np) == 0:
+            return None
+            
+        # 移除过小的音频信号（噪声抑制）
+        rms = np.sqrt(np.mean(audio_np**2))
+        if rms < 0.001:  # 静音阈值
+            return None
+            
+        # 规范化音频
         max_val = np.max(np.abs(audio_np))
         if max_val > 1.0:
-            print(f"[AUDIO_VALIDATION] Audio clipping detected (max: {max_val:.3f}), normalizing")
             audio_np = audio_np / max_val
-            was_normalized = True
+            
+        # 确保块大小合理（带宽优化）
+        if len(audio_np) > AUDIO_CHUNK_SIZE * 2:  # 如果块太大，截断
+            audio_np = audio_np[:AUDIO_CHUNK_SIZE]
+        elif len(audio_np) < AUDIO_CHUNK_SIZE // 4:  # 如果块太小，填充或丢弃
+            return None
+            
+        # 简单的降噪（移除小幅度信号）
+        noise_floor = 0.01
+        audio_np = np.where(np.abs(audio_np) < noise_floor, 0, audio_np)
         
-        # 重采样到标准采样率（如果需要）
-        if chunk_samplerate != STANDARD_SAMPLERATE:
-            print(f"[AUDIO_PROCESSING] Resampling from {chunk_samplerate}Hz to {STANDARD_SAMPLERATE}Hz")
-            audio_np = _resample_audio_server(audio_np, chunk_samplerate, STANDARD_SAMPLERATE)
-            was_resampled = True
-        
-        # 应用音频质量增强
-        enhanced_audio = _enhance_audio_quality(audio_np)
-        if not np.array_equal(enhanced_audio, audio_np):
-            was_enhanced = True
-        
-        # 更新统计
-        _update_audio_stats(
-            original_length, 
-            was_resampled=was_resampled,
-            was_normalized=was_normalized, 
-            was_enhanced=was_enhanced,
-            had_error=had_error
-        )
-        
-        return enhanced_audio.tolist(), None
+        return audio_np.tolist()
         
     except Exception as e:
-        had_error = True
-        print(f"[AUDIO_PROCESSING] Error processing audio: {e}")
-        _update_audio_stats(
-            len(audio_data) if isinstance(audio_data, list) else 0,
-            was_resampled=was_resampled,
-            was_normalized=was_normalized,
-            was_enhanced=was_enhanced,
-            had_error=had_error
-        )
-        return None, f"Audio processing error: {str(e)}"
+        print(f"Error optimizing audio chunk: {e}")
+        return None
 
-def _enhance_audio_quality(audio_data):
-    """音频质量增强"""
+def should_forward_audio(user_id, channel_id):
+    """
+    判断是否应该转发音频（基于活动状态和带宽优化）
+    """
+    current_time = time.time()
+    
+    # 更新用户活动时间
+    user_last_activity[user_id] = current_time
+    
+    # 将用户添加到活跃说话者列表
+    active_speakers[channel_id].add(user_id)
+    
+    # 清理过期的活跃说话者
+    expired_users = []
+    for speaker_id in active_speakers[channel_id]:
+        if current_time - user_last_activity[speaker_id] > VOICE_ACTIVITY_TIMEOUT:
+            expired_users.append(speaker_id)
+    
+    for expired_user in expired_users:
+        active_speakers[channel_id].discard(expired_user)
+        if expired_user in audio_buffers:
+            audio_buffers[expired_user].clear()
+    
+    # 限制同时活跃说话者数量（带宽控制）
+    max_concurrent_speakers = 4
+    if len(active_speakers[channel_id]) > max_concurrent_speakers:
+        # 保留最近活动的说话者
+        sorted_speakers = sorted(
+            active_speakers[channel_id], 
+            key=lambda uid: user_last_activity[uid], 
+            reverse=True
+        )
+        active_speakers[channel_id] = set(sorted_speakers[:max_concurrent_speakers])
+        
+        # 如果当前用户不在活跃列表中，不转发
+        if user_id not in active_speakers[channel_id]:
+            return False
+    
+    return True
+
+def compress_audio_for_transmission(audio_data):
+    """
+    为传输压缩音频数据（简单的量化和舍入）
+    """
     try:
-        # 简单的降噪：移除极小的信号（可能是噪音）
-        noise_threshold = 0.001
-        audio_data[np.abs(audio_data) < noise_threshold] = 0
+        if not audio_data:
+            return audio_data
+            
+        # 减少精度以节省带宽（从float32到16位精度）
+        audio_np = np.array(audio_data, dtype=np.float32)
         
-        # 轻微的平滑处理以减少噪音（简单的3点移动平均）
-        if len(audio_data) > 2:
-            smoothed = np.copy(audio_data)
-            for i in range(1, len(audio_data) - 1):
-                smoothed[i] = (audio_data[i-1] + audio_data[i] + audio_data[i+1]) / 3.0
-            audio_data = smoothed
+        # 量化到16位精度
+        quantized = np.round(audio_np * 32767) / 32767
         
-        return audio_data
+        # 移除非常小的值
+        threshold = 1.0 / 32767
+        quantized = np.where(np.abs(quantized) < threshold, 0, quantized)
+        
+        return quantized.tolist()
+        
     except Exception as e:
-        print(f"[AUDIO_ENHANCEMENT] Error enhancing audio: {e}")
-        return audio_data  # 返回原始数据如果增强失败
+        print(f"Error compressing audio: {e}")
+        return audio_data
 
 # 初始化扩展
 db.init_app(app)
@@ -151,39 +142,6 @@ login_manager = LoginManager(app)
 
 # 全局存储连接的用户状态 (user_id: {username, sid, online, avatar_url, is_admin})
 connected_users = {}
-
-# --- 音频质量统计 ---
-audio_stats = {
-    'total_chunks_processed': 0,
-    'chunks_resampled': 0,
-    'chunks_normalized': 0,
-    'chunks_enhanced': 0,
-    'processing_errors': 0,
-    'average_chunk_size': 0,
-    'last_reset': datetime.utcnow()
-}
-
-def _update_audio_stats(chunk_size, was_resampled=False, was_normalized=False, was_enhanced=False, had_error=False):
-    """更新音频处理统计"""
-    global audio_stats
-    
-    audio_stats['total_chunks_processed'] += 1
-    if was_resampled:
-        audio_stats['chunks_resampled'] += 1
-    if was_normalized:
-        audio_stats['chunks_normalized'] += 1
-    if was_enhanced:
-        audio_stats['chunks_enhanced'] += 1
-    if had_error:
-        audio_stats['processing_errors'] += 1
-    
-    # 更新平均块大小（简单移动平均）
-    if audio_stats['total_chunks_processed'] == 1:
-        audio_stats['average_chunk_size'] = chunk_size
-    else:
-        audio_stats['average_chunk_size'] = (
-            audio_stats['average_chunk_size'] * 0.9 + chunk_size * 0.1
-        )
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -426,6 +384,18 @@ def handle_disconnect():
             db.session.delete(session)
             db.session.commit()
             print(f"Cleaned up voice session for user {current_user.id} from channel {channel_id_being_left}")
+
+        # 清理音频相关状态
+        if current_user.id in audio_buffers:
+            audio_buffers[current_user.id].clear()
+            del audio_buffers[current_user.id]
+        
+        if current_user.id in user_last_activity:
+            del user_last_activity[current_user.id]
+            
+        # 从所有频道的活跃说话者列表中移除
+        for channel_speakers in active_speakers.values():
+            channel_speakers.discard(current_user.id)
 
         if current_user.id in connected_users:
              del connected_users[current_user.id]
@@ -697,13 +667,16 @@ def handle_user_microphone_status(data):
 # WebSocket: 接收并转发语音数据流
 @socketio.on('voice_data_stream')
 def handle_voice_data_stream(data):
-    print(f"[VOICE_DATA_STREAM] Event received. SID: {request.sid}, User: {current_user.username if current_user.is_authenticated else 'N/A'}. Data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}") # Initial event reception log
     if not current_user.is_authenticated:
         print("[VOICE_DATA_STREAM] Received voice data from unauthenticated user.")
         return
 
     channel_id = data.get('channel_id')
-    audio_data = data.get('audio_data') # This is a list of floats (samples)
+    audio_data = data.get('audio_data')  # List of floats (samples)
+    client_samplerate = data.get('samplerate', STANDARD_SAMPLERATE)
+    client_channels = data.get('channels', STANDARD_CHANNELS)
+    client_dtype = data.get('dtype', 'float32')
+    
     user_id = current_user.id
     username = current_user.username
 
@@ -711,47 +684,61 @@ def handle_voice_data_stream(data):
         print(f"[VOICE_DATA_STREAM] Missing channel_id or audio_data for user {user_id}. Discarding.")
         return
     
-    # 构建音频元数据
-    audio_metadata = {
-        'samplerate': data.get('samplerate', STANDARD_SAMPLERATE),
-        'channels': data.get('channels', STANDARD_CHANNELS),
-        'dtype': data.get('dtype', STANDARD_DTYPE)
-    }
-    
-    # 验证和处理音频数据
-    processed_audio, error_msg = _validate_and_process_audio(audio_data, audio_metadata)
-    
-    if processed_audio is None:
-        print(f"[VOICE_DATA_STREAM] Audio validation failed for user {user_id}: {error_msg}")
-        # 可选：向客户端发送错误消息
-        emit('audio_processing_error', {'message': error_msg}, room=request.sid)
+    # 检查是否应该转发音频（带宽和活动控制）
+    if not should_forward_audio(user_id, channel_id):
+        # print(f"[VOICE_DATA_STREAM] Skipping audio forward for user {user_id} due to activity limits.")
         return
     
-    # 如果音频数据长度发生变化，记录日志
-    if len(processed_audio) != len(audio_data):
-        print(f"[VOICE_DATA_STREAM] Audio length changed from {len(audio_data)} to {len(processed_audio)} samples for user {user_id}")
+    # 音频格式验证和标准化
+    if client_samplerate != STANDARD_SAMPLERATE:
+        print(f"[VOICE_DATA_STREAM] Warning: Client {user_id} using non-standard samplerate {client_samplerate}Hz")
+    
+    if client_channels != STANDARD_CHANNELS:
+        print(f"[VOICE_DATA_STREAM] Warning: Client {user_id} using {client_channels} channels, expected {STANDARD_CHANNELS}")
+    
+    # 优化音频数据
+    optimized_audio = optimize_audio_chunk(audio_data, client_samplerate)
+    if optimized_audio is None:
+        # 静音或无效数据，不转发
+        return
+    
+    # 压缩音频以节省带宽
+    compressed_audio = compress_audio_for_transmission(optimized_audio)
+    
+    # 添加到用户音频缓冲区（防止音频丢失）
+    audio_buffers[user_id].append({
+        'audio_data': compressed_audio,
+        'timestamp': time.time(),
+        'channel_id': channel_id
+    })
     
     room_name = f"voice_channel_{channel_id}"
-    # print(f"[VOICE_DATA_STREAM] User {user_id} ({username}) sending processed audio to channel {channel_id} (room: {room_name}). Chunk size: {len(processed_audio)} samples.")
+    
+    # 记录优化效果
+    original_size = len(audio_data) if audio_data else 0
+    compressed_size = len(compressed_audio) if compressed_audio else 0
+    # print(f"[VOICE_DATA_STREAM] User {user_id} audio: {original_size} -> {compressed_size} samples (channel {channel_id})")
 
-    # 1. Broadcast that this user is actively sending voice data (for card color change)
+    # 1. 广播用户语音活动状态
     emit('user_voice_activity', 
          {'channel_id': channel_id, 'user_id': user_id, 'username': username, 'active': True}, 
-         room=room_name) # REMOVED: skip_sid=request.sid
+         room=room_name)
 
-    # 2. Forward the processed audio data chunk to others in the room with standardized metadata
+    # 2. 转发优化后的音频数据，包含标准化的元数据
     emit('voice_data_stream_chunk', 
          {
              'channel_id': channel_id, 
              'user_id': user_id, 
              'username': username, 
-             'audio_data': processed_audio,
-             'samplerate': STANDARD_SAMPLERATE,  # 总是发送标准采样率
-             'channels': STANDARD_CHANNELS,      # 总是发送标准声道数
-             'dtype': STANDARD_DTYPE             # 总是发送标准数据类型
+             'audio_data': compressed_audio,
+             'samplerate': STANDARD_SAMPLERATE,  # 强制标准采样率
+             'channels': STANDARD_CHANNELS,      # 强制单声道
+             'dtype': 'float32',                 # 标准数据类型
+             'chunk_size': len(compressed_audio),
+             'server_optimized': True            # 标记为服务端优化过的数据
          }, 
          room=room_name, 
-         skip_sid=request.sid) # Still skip SID for the audio data itself to avoid self-playback of raw audio
+         skip_sid=request.sid)
 
 # WebSocket: WebRTC信令
 @socketio.on('voice_signal')
@@ -899,100 +886,6 @@ def delete_channel_api(channel_id):
     except Exception as e:
         db.session.rollback()
         return jsonify(success=False, message=f"删除频道失败: {str(e)}"), 500
-
-# API: Get audio format configuration
-@app.route('/api/audio/config', methods=['GET'])
-@login_required
-def get_audio_config_api():
-    """返回服务端音频配置信息，供客户端协商格式使用"""
-    return jsonify({
-        'success': True,
-        'audio_config': {
-            'samplerate': STANDARD_SAMPLERATE,
-            'channels': STANDARD_CHANNELS,
-            'dtype': STANDARD_DTYPE,
-            'max_chunk_size': MAX_AUDIO_CHUNK_SIZE,
-            'min_chunk_size': MIN_AUDIO_CHUNK_SIZE,
-            'supported_samplerates': [22050, 44100, 48000],  # 服务端支持的采样率
-            'resampling_available': SCIPY_AVAILABLE,
-            'audio_enhancement': True
-        }
-    })
-
-# API: Test audio processing
-@app.route('/api/audio/test', methods=['POST'])
-@login_required
-def test_audio_processing_api():
-    """测试音频处理功能的API端点"""
-    data = request.get_json()
-    if not data:
-        return jsonify(success=False, message="Request body cannot be empty"), 400
-    
-    test_audio = data.get('audio_data')
-    test_metadata = data.get('metadata', {})
-    
-    if not test_audio:
-        return jsonify(success=False, message="audio_data is required"), 400
-    
-    processed_audio, error_msg = _validate_and_process_audio(test_audio, test_metadata)
-    
-    if processed_audio is None:
-        return jsonify(success=False, message=error_msg), 400
-    
-    return jsonify({
-        'success': True,
-        'original_length': len(test_audio),
-        'processed_length': len(processed_audio),
-        'message': 'Audio processing test successful'
-    })
-
-# API: Get audio statistics
-@app.route('/api/audio/stats', methods=['GET'])
-@login_required
-def get_audio_stats_api():
-    """获取音频处理统计信息（管理员专用）"""
-    if not current_user.is_admin:
-        return jsonify(success=False, message='仅限管理员访问'), 403
-    
-    return jsonify({
-        'success': True,
-        'audio_stats': {
-            **audio_stats,
-            'last_reset': audio_stats['last_reset'].isoformat(),
-            'processing_success_rate': (
-                (audio_stats['total_chunks_processed'] - audio_stats['processing_errors']) / 
-                max(audio_stats['total_chunks_processed'], 1) * 100
-            ),
-            'resampling_rate': (
-                audio_stats['chunks_resampled'] / 
-                max(audio_stats['total_chunks_processed'], 1) * 100
-            )
-        }
-    })
-
-# API: Reset audio statistics
-@app.route('/api/audio/stats/reset', methods=['POST'])
-@login_required
-def reset_audio_stats_api():
-    """重置音频处理统计（管理员专用）"""
-    if not current_user.is_admin:
-        return jsonify(success=False, message='仅限管理员访问'), 403
-    
-    global audio_stats
-    audio_stats = {
-        'total_chunks_processed': 0,
-        'chunks_resampled': 0,
-        'chunks_normalized': 0,
-        'chunks_enhanced': 0,
-        'processing_errors': 0,
-        'average_chunk_size': 0,
-        'last_reset': datetime.utcnow()
-    }
-    
-    return jsonify({
-        'success': True,
-        'message': 'Audio statistics reset successfully'
-    })
 
 if __name__ == '__main__':
     with app.app_context():
