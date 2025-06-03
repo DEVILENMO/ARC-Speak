@@ -4,10 +4,7 @@ from flask_login import LoginManager, login_user, logout_user, login_required, c
 from werkzeug.security import generate_password_hash, check_password_hash
 from models import db, User, Channel, Message, VoiceSession
 import os
-import numpy as np
-import time
 from datetime import datetime
-from collections import defaultdict, deque
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24)
@@ -17,123 +14,6 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # Constants for message loading
 INITIAL_MESSAGE_LOAD_COUNT = 20
 OLDER_MESSAGE_LOAD_COUNT = 20
-
-# --- 音频优化配置 ---
-STANDARD_SAMPLERATE = 48000  # 统一采样率
-STANDARD_CHANNELS = 1        # 单声道
-AUDIO_CHUNK_SIZE = 960       # 20ms @ 48kHz
-MAX_AUDIO_BUFFER_SIZE = 5    # 每用户最大缓冲音频块数
-VOICE_ACTIVITY_TIMEOUT = 3.0 # 语音活动超时时间
-
-# 音频缓冲和带宽优化
-audio_buffers = defaultdict(lambda: deque(maxlen=MAX_AUDIO_BUFFER_SIZE))  # user_id: deque of audio chunks
-user_last_activity = defaultdict(float)  # user_id: last_activity_time
-active_speakers = defaultdict(set)  # channel_id: set of active user_ids
-
-def optimize_audio_chunk(audio_data, original_samplerate=None):
-    """
-    优化音频数据块，减少带宽并确保质量
-    """
-    try:
-        if not audio_data or not isinstance(audio_data, (list, np.ndarray)):
-            return None
-            
-        # 转换为numpy数组
-        audio_np = np.array(audio_data, dtype=np.float32)
-        
-        # 基本音频质量检查
-        if len(audio_np) == 0:
-            return None
-            
-        # 移除过小的音频信号（噪声抑制）
-        rms = np.sqrt(np.mean(audio_np**2))
-        if rms < 0.001:  # 静音阈值
-            return None
-            
-        # 规范化音频
-        max_val = np.max(np.abs(audio_np))
-        if max_val > 1.0:
-            audio_np = audio_np / max_val
-            
-        # 确保块大小合理（带宽优化）
-        if len(audio_np) > AUDIO_CHUNK_SIZE * 2:  # 如果块太大，截断
-            audio_np = audio_np[:AUDIO_CHUNK_SIZE]
-        elif len(audio_np) < AUDIO_CHUNK_SIZE // 4:  # 如果块太小，填充或丢弃
-            return None
-            
-        # 简单的降噪（移除小幅度信号）
-        noise_floor = 0.01
-        audio_np = np.where(np.abs(audio_np) < noise_floor, 0, audio_np)
-        
-        return audio_np.tolist()
-        
-    except Exception as e:
-        print(f"Error optimizing audio chunk: {e}")
-        return None
-
-def should_forward_audio(user_id, channel_id):
-    """
-    判断是否应该转发音频（基于活动状态和带宽优化）
-    """
-    current_time = time.time()
-    
-    # 更新用户活动时间
-    user_last_activity[user_id] = current_time
-    
-    # 将用户添加到活跃说话者列表
-    active_speakers[channel_id].add(user_id)
-    
-    # 清理过期的活跃说话者
-    expired_users = []
-    for speaker_id in active_speakers[channel_id]:
-        if current_time - user_last_activity[speaker_id] > VOICE_ACTIVITY_TIMEOUT:
-            expired_users.append(speaker_id)
-    
-    for expired_user in expired_users:
-        active_speakers[channel_id].discard(expired_user)
-        if expired_user in audio_buffers:
-            audio_buffers[expired_user].clear()
-    
-    # 限制同时活跃说话者数量（带宽控制）
-    max_concurrent_speakers = 4
-    if len(active_speakers[channel_id]) > max_concurrent_speakers:
-        # 保留最近活动的说话者
-        sorted_speakers = sorted(
-            active_speakers[channel_id], 
-            key=lambda uid: user_last_activity[uid], 
-            reverse=True
-        )
-        active_speakers[channel_id] = set(sorted_speakers[:max_concurrent_speakers])
-        
-        # 如果当前用户不在活跃列表中，不转发
-        if user_id not in active_speakers[channel_id]:
-            return False
-    
-    return True
-
-def compress_audio_for_transmission(audio_data):
-    """
-    为传输压缩音频数据（简单的量化和舍入）
-    """
-    try:
-        if not audio_data:
-            return audio_data
-            
-        # 减少精度以节省带宽（从float32到16位精度）
-        audio_np = np.array(audio_data, dtype=np.float32)
-        
-        # 量化到16位精度
-        quantized = np.round(audio_np * 32767) / 32767
-        
-        # 移除非常小的值
-        threshold = 1.0 / 32767
-        quantized = np.where(np.abs(quantized) < threshold, 0, quantized)
-        
-        return quantized.tolist()
-        
-    except Exception as e:
-        print(f"Error compressing audio: {e}")
-        return audio_data
 
 # 初始化扩展
 db.init_app(app)
@@ -384,18 +264,6 @@ def handle_disconnect():
             db.session.delete(session)
             db.session.commit()
             print(f"Cleaned up voice session for user {current_user.id} from channel {channel_id_being_left}")
-
-        # 清理音频相关状态
-        if current_user.id in audio_buffers:
-            audio_buffers[current_user.id].clear()
-            del audio_buffers[current_user.id]
-        
-        if current_user.id in user_last_activity:
-            del user_last_activity[current_user.id]
-            
-        # 从所有频道的活跃说话者列表中移除
-        for channel_speakers in active_speakers.values():
-            channel_speakers.discard(current_user.id)
 
         if current_user.id in connected_users:
              del connected_users[current_user.id]
@@ -667,16 +535,13 @@ def handle_user_microphone_status(data):
 # WebSocket: 接收并转发语音数据流
 @socketio.on('voice_data_stream')
 def handle_voice_data_stream(data):
+    print(f"[VOICE_DATA_STREAM] Event received. SID: {request.sid}, User: {current_user.username if current_user.is_authenticated else 'N/A'}. Data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}") # Initial event reception log
     if not current_user.is_authenticated:
         print("[VOICE_DATA_STREAM] Received voice data from unauthenticated user.")
         return
 
     channel_id = data.get('channel_id')
-    audio_data = data.get('audio_data')  # List of floats (samples)
-    client_samplerate = data.get('samplerate', STANDARD_SAMPLERATE)
-    client_channels = data.get('channels', STANDARD_CHANNELS)
-    client_dtype = data.get('dtype', 'float32')
-    
+    audio_data = data.get('audio_data') # This is a list of floats (samples)
     user_id = current_user.id
     username = current_user.username
 
@@ -684,61 +549,19 @@ def handle_voice_data_stream(data):
         print(f"[VOICE_DATA_STREAM] Missing channel_id or audio_data for user {user_id}. Discarding.")
         return
     
-    # 检查是否应该转发音频（带宽和活动控制）
-    if not should_forward_audio(user_id, channel_id):
-        # print(f"[VOICE_DATA_STREAM] Skipping audio forward for user {user_id} due to activity limits.")
-        return
-    
-    # 音频格式验证和标准化
-    if client_samplerate != STANDARD_SAMPLERATE:
-        print(f"[VOICE_DATA_STREAM] Warning: Client {user_id} using non-standard samplerate {client_samplerate}Hz")
-    
-    if client_channels != STANDARD_CHANNELS:
-        print(f"[VOICE_DATA_STREAM] Warning: Client {user_id} using {client_channels} channels, expected {STANDARD_CHANNELS}")
-    
-    # 优化音频数据
-    optimized_audio = optimize_audio_chunk(audio_data, client_samplerate)
-    if optimized_audio is None:
-        # 静音或无效数据，不转发
-        return
-    
-    # 压缩音频以节省带宽
-    compressed_audio = compress_audio_for_transmission(optimized_audio)
-    
-    # 添加到用户音频缓冲区（防止音频丢失）
-    audio_buffers[user_id].append({
-        'audio_data': compressed_audio,
-        'timestamp': time.time(),
-        'channel_id': channel_id
-    })
-    
     room_name = f"voice_channel_{channel_id}"
-    
-    # 记录优化效果
-    original_size = len(audio_data) if audio_data else 0
-    compressed_size = len(compressed_audio) if compressed_audio else 0
-    # print(f"[VOICE_DATA_STREAM] User {user_id} audio: {original_size} -> {compressed_size} samples (channel {channel_id})")
+    # print(f"[VOICE_DATA_STREAM] User {user_id} ({username}) sending audio to channel {channel_id} (room: {room_name}). Chunk size: {len(audio_data)} samples.")
 
-    # 1. 广播用户语音活动状态
+    # 1. Broadcast that this user is actively sending voice data (for card color change)
     emit('user_voice_activity', 
          {'channel_id': channel_id, 'user_id': user_id, 'username': username, 'active': True}, 
-         room=room_name)
+         room=room_name) # REMOVED: skip_sid=request.sid
 
-    # 2. 转发优化后的音频数据，包含标准化的元数据
+    # 2. Forward the actual audio data chunk to others in the room
     emit('voice_data_stream_chunk', 
-         {
-             'channel_id': channel_id, 
-             'user_id': user_id, 
-             'username': username, 
-             'audio_data': compressed_audio,
-             'samplerate': STANDARD_SAMPLERATE,  # 强制标准采样率
-             'channels': STANDARD_CHANNELS,      # 强制单声道
-             'dtype': 'float32',                 # 标准数据类型
-             'chunk_size': len(compressed_audio),
-             'server_optimized': True            # 标记为服务端优化过的数据
-         }, 
-         room=room_name, 
-         skip_sid=request.sid)
+         {'channel_id': channel_id, 'user_id': user_id, 'username': username, 'audio_data': audio_data}, 
+             room=room_name, 
+         skip_sid=request.sid) # Still skip SID for the audio data itself to avoid self-playback of raw audio
 
 # WebSocket: WebRTC信令
 @socketio.on('voice_signal')
